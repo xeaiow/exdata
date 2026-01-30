@@ -201,6 +201,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             });
                         item.a = parse_f64(&t.lowest_ask);
                         item.b = parse_f64(&t.highest_bid);
+                        item.ts = now_ms();
                         item.trade24_count = parse_f64(&t.quote_volume);
                     }
                     tracing::info!(
@@ -232,87 +233,108 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
-                // Read loop - Gate.io handles heartbeat via server-side pings (tungstenite auto-replies)
-                while let Some(msg) = read.next().await {
-                    let text = match msg {
-                        Ok(Message::Text(t)) => t,
-                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-                        Ok(Message::Close(_)) => {
-                            tracing::warn!("gate spot: server closed connection");
+                // Read loop
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+                loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                            let msg = match msg {
+                                Some(Ok(m)) => m,
+                                Some(Err(e)) => {
+                                    tracing::warn!("gate spot: read error: {}", e);
+                                    break;
+                                }
+                                None => {
+                                    tracing::warn!("gate spot: stream ended");
+                                    break;
+                                }
+                            };
+
+                            let text = match msg {
+                                Message::Text(t) => t,
+                                Message::Ping(_) | Message::Pong(_) => continue,
+                                Message::Close(_) => {
+                                    tracing::warn!("gate spot: server closed connection");
+                                    break;
+                                }
+                                _ => continue,
+                            };
+
+                            let text_str: &str = text.as_ref();
+
+                            let ws_msg: GateWsMsg = match serde_json::from_str(text_str) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("gate spot: parse error: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            // Skip non-update messages (subscribe confirmations, etc.)
+                            match ws_msg.event.as_deref() {
+                                Some("update") => {}
+                                _ => continue,
+                            }
+
+                            match ws_msg.channel.as_deref() {
+                                Some("spot.tickers") => {}
+                                _ => continue,
+                            }
+
+                            let result = match ws_msg.result {
+                                Some(v) => v,
+                                None => continue,
+                            };
+
+                            // spot.tickers result is a single object, NOT an array
+                            let currency_pair = result
+                                .get("currency_pair")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if currency_pair.is_empty() {
+                                continue;
+                            }
+
+                            let lowest_ask = result
+                                .get("lowest_ask")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            let highest_bid = result
+                                .get("highest_bid")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            let quote_volume = result
+                                .get("quote_volume")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+
+                            let normalized = normalize_symbol(currency_pair);
+                            let ts = now_ms();
+
+                            let mut section = cache.gate_spot.write().await;
+                            section.ts = ts;
+
+                            let item = section
+                                .items
+                                .entry(normalized.clone())
+                                .or_insert_with(|| ExchangeItem {
+                                    name: normalized,
+                                    ..Default::default()
+                                });
+                            item.a = parse_f64(lowest_ask);
+                            item.b = parse_f64(highest_bid);
+                            item.ts = ts;
+                            item.trade24_count = parse_f64(quote_volume);
+                            section.serialize_cache();
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("gate spot: no message for 30s, reconnecting");
                             break;
                         }
-                        Ok(_) => continue,
-                        Err(e) => {
-                            tracing::warn!("gate spot: read error: {}", e);
-                            break;
-                        }
-                    };
-
-                    let text_str: &str = text.as_ref();
-
-                    let ws_msg: GateWsMsg = match serde_json::from_str(text_str) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("gate spot: parse error: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Skip non-update messages (subscribe confirmations, etc.)
-                    match ws_msg.event.as_deref() {
-                        Some("update") => {}
-                        _ => continue,
                     }
-
-                    match ws_msg.channel.as_deref() {
-                        Some("spot.tickers") => {}
-                        _ => continue,
-                    }
-
-                    let result = match ws_msg.result {
-                        Some(v) => v,
-                        None => continue,
-                    };
-
-                    // spot.tickers result is a single object, NOT an array
-                    let currency_pair = result
-                        .get("currency_pair")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if currency_pair.is_empty() {
-                        continue;
-                    }
-
-                    let lowest_ask = result
-                        .get("lowest_ask")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0");
-                    let highest_bid = result
-                        .get("highest_bid")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0");
-                    let quote_volume = result
-                        .get("quote_volume")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0");
-
-                    let normalized = normalize_symbol(currency_pair);
-                    let ts = now_ms();
-
-                    let mut section = cache.gate_spot.write().await;
-                    section.ts = ts;
-
-                    let item = section
-                        .items
-                        .entry(normalized.clone())
-                        .or_insert_with(|| ExchangeItem {
-                            name: normalized,
-                            ..Default::default()
-                        });
-                    item.a = parse_f64(lowest_ask);
-                    item.b = parse_f64(highest_bid);
-                    item.trade24_count = parse_f64(quote_volume);
-                    section.serialize_cache();
                 }
             }
             Err(e) => {
@@ -400,10 +422,14 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::interval(std::time::Duration::from_secs(300));
                 refresh_interval.tick().await; // consume the immediate first tick
 
-                // Read loop - Gate.io handles heartbeat via server-side pings (tungstenite auto-replies)
+                // Read loop
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
                 loop {
                     tokio::select! {
                         msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
@@ -593,6 +619,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
                                     item.a = parse_f64(ask);
                                     item.b = parse_f64(bid);
+                                    item.ts = ts;
 
                                     // Ensure funding info stays applied
                                     if item.rate_interval.is_none() {
@@ -609,6 +636,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     tracing::warn!("gate futures: unknown channel: {}", channel);
                                 }
                             }
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("gate futures: no message for 30s, reconnecting");
+                            break;
                         }
                         _ = refresh_interval.tick() => {
                             tracing::info!("gate futures: refreshing contracts list...");

@@ -129,6 +129,25 @@ async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<OkxTickerItem> {
     body.data
 }
 
+async fn fetch_swap_tickers(client: &reqwest::Client) -> Vec<OkxTickerItem> {
+    let url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("okx futures: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let body: OkxTickersResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("okx futures: tickers parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.data
+}
+
 /// Fetch swap instrument instIds (USDT settle, linear, live state).
 async fn fetch_swap_instruments(client: &reqwest::Client) -> Vec<String> {
     let url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
@@ -204,6 +223,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             });
                         item.a = parse_f64(&t.ask_px);
                         item.b = parse_f64(&t.bid_px);
+                        item.ts = now_ms();
                         item.trade24_count = parse_f64(&t.vol_ccy_24h);
                     }
                     tracing::info!(
@@ -240,10 +260,13 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(25));
                 ping_interval.tick().await; // consume the immediate first tick
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
                 loop {
                     tokio::select! {
                         msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
@@ -334,8 +357,13 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 });
                             item.a = parse_f64(ask_px);
                             item.b = parse_f64(bid_px);
+                            item.ts = ts;
                             item.trade24_count = parse_f64(vol_ccy);
                             section.serialize_cache();
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("okx spot: no message for 30s, reconnecting");
+                            break;
                         }
                         _ = ping_interval.tick() => {
                             // OKX uses plain text "ping" for heartbeat
@@ -413,6 +441,38 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
+                // Seed bid/ask from REST
+                let swap_tickers = fetch_swap_tickers(&client).await;
+                if !swap_tickers.is_empty() {
+                    let instruments_set: HashSet<&String> = instruments.iter().collect();
+                    let ts = now_ms();
+                    let mut section = cache.okx_future.write().await;
+                    for t in &swap_tickers {
+                        if !instruments_set.contains(&t.inst_id) {
+                            continue;
+                        }
+                        let normalized = normalize_swap(&t.inst_id);
+                        let item = section
+                            .items
+                            .entry(normalized.clone())
+                            .or_insert_with(|| ExchangeItem {
+                                name: normalized,
+                                rate_interval: Some(0),
+                                rate_max: Some("--".to_string()),
+                                ..Default::default()
+                            });
+                        item.a = parse_f64(&t.ask_px);
+                        item.b = parse_f64(&t.bid_px);
+                        item.ts = ts;
+                        item.trade24_count = parse_f64(&t.vol_ccy_24h);
+                    }
+                    tracing::info!(
+                        "okx futures: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                    section.serialize_cache();
+                }
+
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(25));
                 ping_interval.tick().await; // consume the immediate first tick
@@ -420,10 +480,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
                 refresh_interval.tick().await; // consume the immediate first tick
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
                 loop {
                     tokio::select! {
                         msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
@@ -512,6 +575,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         });
                                     item.a = parse_f64(ask_px);
                                     item.b = parse_f64(bid_px);
+                                    item.ts = ts;
                                     item.trade24_count = parse_f64(vol_ccy);
                                     section.serialize_cache();
                                 }
@@ -570,6 +634,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     );
                                 }
                             }
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("okx futures: no message for 30s, reconnecting");
+                            break;
                         }
                         _ = ping_interval.tick() => {
                             // OKX uses plain text "ping" for heartbeat

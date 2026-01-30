@@ -1,7 +1,7 @@
 use crate::cache::SharedCache;
 use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
 use crate::models::ExchangeItem;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -72,51 +72,82 @@ pub async fn run_spot(cache: SharedCache) {
             Ok((ws, _)) => {
                 attempt = 0;
                 tracing::info!("binance spot: connected");
-                let (_, mut read) = ws.split();
+                let (mut write, mut read) = ws.split();
 
-                while let Some(msg) = read.next().await {
-                    let text = match msg {
-                        Ok(Message::Text(t)) => t,
-                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-                        Ok(Message::Close(_)) => {
-                            tracing::warn!("binance spot: server closed connection");
+                let mut ping_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(30));
+                ping_interval.tick().await; // consume the immediate first tick
+
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+                loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                            let msg = match msg {
+                                Some(Ok(m)) => m,
+                                Some(Err(e)) => {
+                                    tracing::warn!("binance spot: read error: {}", e);
+                                    break;
+                                }
+                                None => {
+                                    tracing::warn!("binance spot: stream ended");
+                                    break;
+                                }
+                            };
+
+                            let text = match msg {
+                                Message::Text(t) => t,
+                                Message::Ping(_) | Message::Pong(_) => continue,
+                                Message::Close(_) => {
+                                    tracing::warn!("binance spot: server closed connection");
+                                    break;
+                                }
+                                _ => continue,
+                            };
+
+                            let tickers: Vec<SpotTicker> = match serde_json::from_str(&text) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("binance spot: parse error: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let ts = now_ms();
+                            let mut section = cache.binance_spot.write().await;
+                            section.ts = ts;
+
+                            for t in &tickers {
+                                if !t.s.ends_with("USDT") {
+                                    continue;
+                                }
+                                let item = section
+                                    .items
+                                    .entry(t.s.clone())
+                                    .or_insert_with(|| ExchangeItem {
+                                        name: t.s.clone(),
+                                        ..Default::default()
+                                    });
+                                item.a = parse_f64(&t.a);
+                                item.b = parse_f64(&t.b);
+                                item.ts = ts;
+                                item.trade24_count = parse_f64(&t.q);
+                            }
+                            section.serialize_cache();
+                        }
+                        _ = ping_interval.tick() => {
+                            if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                                tracing::error!("binance spot: ping send error: {}", e);
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("binance spot: no message for 30s, reconnecting");
                             break;
                         }
-                        Ok(_) => continue,
-                        Err(e) => {
-                            tracing::warn!("binance spot: read error: {}", e);
-                            break;
-                        }
-                    };
-
-                    let tickers: Vec<SpotTicker> = match serde_json::from_str(&text) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("binance spot: parse error: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let ts = now_ms();
-                    let mut section = cache.binance_spot.write().await;
-                    section.ts = ts;
-
-                    for t in &tickers {
-                        if !t.s.ends_with("USDT") {
-                            continue;
-                        }
-                        let item = section
-                            .items
-                            .entry(t.s.clone())
-                            .or_insert_with(|| ExchangeItem {
-                                name: t.s.clone(),
-                                ..Default::default()
-                            });
-                        item.a = parse_f64(&t.a);
-                        item.b = parse_f64(&t.b);
-                        item.trade24_count = parse_f64(&t.q);
                     }
-                    section.serialize_cache();
                 }
             }
             Err(e) => {
@@ -217,6 +248,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             });
                         item.a = parse_f64(&bt.ask_price);
                         item.b = parse_f64(&bt.bid_price);
+                        item.ts = now_ms();
                     }
                     tracing::info!(
                         "binance futures: seeded {} book tickers from REST",
@@ -225,15 +257,23 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     section.serialize_cache();
                 }
 
-                let (_, mut read) = ws.split();
+                let (mut write, mut read) = ws.split();
 
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
                 refresh_interval.tick().await; // consume the immediate first tick
 
+                let mut ping_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(30));
+                ping_interval.tick().await; // consume the immediate first tick
+
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
                 loop {
                     tokio::select! {
                         msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
@@ -290,6 +330,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     });
                                 item.a = parse_f64(&bt.a);
                                 item.b = parse_f64(&bt.b);
+                                item.ts = ts;
                                 // Apply funding info
                                 if let Some((interval, max_rate)) = funding_info.get(&bt.s) {
                                     item.rate_interval = Some(*interval);
@@ -370,6 +411,16 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 tracing::warn!("binance futures: unknown stream: {}", stream);
                             }
                         }
+                        _ = ping_interval.tick() => {
+                            if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                                tracing::error!("binance futures: ping send error: {}", e);
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("binance futures: no message for 30s, reconnecting");
+                            break;
+                        }
                         _ = refresh_interval.tick() => {
                             tracing::info!("binance futures: refreshing instrument list...");
                             let new_funding = fetch_funding_info(&client).await;
@@ -409,6 +460,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                             bt.symbol.clone(),
                                             ExchangeItem {
                                                 name: bt.symbol.clone(),
+                                                ts: now_ms(),
                                                 a: parse_f64(&bt.ask_price),
                                                 b: parse_f64(&bt.bid_price),
                                                 ..Default::default()

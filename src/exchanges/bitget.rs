@@ -119,6 +119,25 @@ async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<SpotTickerItem> {
     body.data
 }
 
+async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<SpotTickerItem> {
+    let url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("bitget futures: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let body: SpotTickersResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("bitget futures: tickers parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.data
+}
+
 /// Funding info for futures: symbol -> (interval_hours, rate_max_str).
 struct FuturesInstrumentData {
     symbols: Vec<String>,
@@ -221,6 +240,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             });
                         item.a = parse_f64(&t.ask_pr);
                         item.b = parse_f64(&t.bid_pr);
+                        item.ts = now_ms();
                         item.trade24_count = parse_f64(&t.quote_volume);
                     }
                     tracing::info!(
@@ -259,10 +279,13 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
                 ping_interval.tick().await; // consume the immediate first tick
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
                 loop {
                     tokio::select! {
                         msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
@@ -353,8 +376,13 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 });
                             item.a = parse_f64(ask_pr);
                             item.b = parse_f64(bid_pr);
+                            item.ts = ts;
                             item.trade24_count = parse_f64(quote_volume);
                             section.serialize_cache();
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("bitget spot: no message for 30s, reconnecting");
+                            break;
                         }
                         _ = ping_interval.tick() => {
                             // Bitget uses plain text "ping" for heartbeat
@@ -432,9 +460,46 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
+                // Seed bid/ask from REST
+                let futures_tickers = fetch_futures_tickers(&client).await;
+                if !futures_tickers.is_empty() {
+                    let ts = now_ms();
+                    let mut section = cache.bitget_future.write().await;
+                    for t in &futures_tickers {
+                        if !current_symbols.contains(&t.symbol) {
+                            continue;
+                        }
+                        let item = section
+                            .items
+                            .entry(t.symbol.clone())
+                            .or_insert_with(|| {
+                                let mut ei = ExchangeItem {
+                                    name: t.symbol.clone(),
+                                    ..Default::default()
+                                };
+                                if let Some((interval, max_rate)) = funding_info.get(&t.symbol) {
+                                    ei.rate_interval = Some(*interval);
+                                    ei.rate_max = Some(max_rate.clone());
+                                }
+                                ei
+                            });
+                        item.a = parse_f64(&t.ask_pr);
+                        item.b = parse_f64(&t.bid_pr);
+                        item.ts = ts;
+                        item.trade24_count = parse_f64(&t.quote_volume);
+                    }
+                    tracing::info!(
+                        "bitget futures: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                    section.serialize_cache();
+                }
+
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
                 ping_interval.tick().await; // consume the immediate first tick
+                let mut read_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
@@ -443,6 +508,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 loop {
                     tokio::select! {
                         msg = read.next() => {
+                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
@@ -554,6 +620,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
                             item.a = parse_f64(ask_pr);
                             item.b = parse_f64(bid_pr);
+                            item.ts = ts;
                             item.trade24_count = parse_f64(quote_volume);
                             item.rate = Some(rate_str);
                             item.mark_price = Some(mark_price.to_string());
@@ -567,6 +634,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 }
                             }
                             section.serialize_cache();
+                        }
+                        _ = tokio::time::sleep_until(read_deadline) => {
+                            tracing::warn!("bitget futures: no message for 30s, reconnecting");
+                            break;
                         }
                         _ = ping_interval.tick() => {
                             // Bitget uses plain text "ping" for heartbeat

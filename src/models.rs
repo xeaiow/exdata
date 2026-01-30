@@ -6,6 +6,8 @@ use std::collections::HashMap;
 #[derive(Clone, Default, Serialize)]
 pub struct ExchangeItem {
     pub name: String,
+    /// Timestamp (ms) when this item's bid/ask was last updated.
+    pub ts: u64,
     pub a: f64,
     pub b: f64,
     #[serde(rename = "trade24Count")]
