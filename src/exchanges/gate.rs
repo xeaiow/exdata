@@ -79,6 +79,37 @@ async fn fetch_spot_symbols(client: &reqwest::Client) -> Vec<String> {
         .collect()
 }
 
+/// Fetch spot ticker snapshot so every symbol has bid/ask from the start.
+/// The WS `spot.tickers` channel is push-on-change only, so illiquid symbols would stay at a=0/b=0.
+#[derive(Deserialize)]
+struct GateSpotTicker {
+    currency_pair: String,
+    #[serde(default)]
+    lowest_ask: String,
+    #[serde(default)]
+    highest_bid: String,
+    #[serde(default)]
+    quote_volume: String,
+}
+
+async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<GateSpotTicker> {
+    let url = "https://api.gateio.ws/api/v4/spot/tickers";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("gate spot: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("gate spot: tickers parse failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Fetch futures contracts: NOT in_delisting.
 async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
     let url = "https://api.gateio.ws/api/v4/futures/usdt/contracts";
@@ -151,6 +182,33 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
             Ok((ws, _)) => {
                 attempt = 0;
                 tracing::info!("gate spot: connected");
+                // Seed bid/ask from REST before entering the WS loop
+                let spot_tickers = fetch_spot_tickers(&client).await;
+                if !spot_tickers.is_empty() {
+                    let symbols_set: HashSet<&String> = symbols.iter().collect();
+                    let mut section = cache.gate_spot.write().await;
+                    for t in &spot_tickers {
+                        if !symbols_set.contains(&t.currency_pair) {
+                            continue;
+                        }
+                        let normalized = normalize_symbol(&t.currency_pair);
+                        let item = section
+                            .items
+                            .entry(normalized.clone())
+                            .or_insert_with(|| ExchangeItem {
+                                name: normalized,
+                                ..Default::default()
+                            });
+                        item.a = parse_f64(&t.lowest_ask);
+                        item.b = parse_f64(&t.highest_bid);
+                        item.trade24_count = parse_f64(&t.quote_volume);
+                    }
+                    tracing::info!(
+                        "gate spot: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                }
+
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 50

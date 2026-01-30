@@ -111,6 +111,48 @@ async fn fetch_spot_symbols(client: &reqwest::Client) -> Vec<String> {
     symbols
 }
 
+/// Fetch spot ticker snapshot (bid1Price, ask1Price, turnover24h) for all USDT symbols.
+/// The WS `tickers` stream is push-on-change only, so illiquid symbols would stay at a=0/b=0.
+#[derive(Deserialize)]
+struct TickersResponse {
+    result: TickersResult,
+}
+
+#[derive(Deserialize)]
+struct TickersResult {
+    list: Vec<RestTickerItem>,
+}
+
+#[derive(Deserialize)]
+struct RestTickerItem {
+    symbol: String,
+    #[serde(rename = "bid1Price", default)]
+    bid1_price: String,
+    #[serde(rename = "ask1Price", default)]
+    ask1_price: String,
+    #[serde(rename = "turnover24h", default)]
+    turnover_24h: String,
+}
+
+async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<RestTickerItem> {
+    let url = "https://api.bybit.com/v5/market/tickers?category=spot";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("bybit spot: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let body: TickersResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("bybit spot: tickers parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.result.list
+}
+
 /// Funding info for futures: symbol -> (interval_hours, rate_max).
 struct FuturesInstrumentData {
     symbols: Vec<String>,
@@ -207,6 +249,34 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
             Ok((ws, _)) => {
                 attempt = 0;
                 tracing::info!("bybit spot: connected");
+                // Seed bid/ask from REST before entering the WS loop
+                let spot_tickers = fetch_spot_tickers(&client).await;
+                if !spot_tickers.is_empty() {
+                    let symbols_set: HashSet<&String> = symbols.iter().collect();
+                    let mut section = cache.bybit_spot.write().await;
+                    for t in &spot_tickers {
+                        if !symbols_set.contains(&t.symbol) {
+                            continue;
+                        }
+                        let item = section
+                            .items
+                            .entry(t.symbol.clone())
+                            .or_insert_with(|| ExchangeItem {
+                                name: t.symbol.clone(),
+                                index_price: Some(String::new()),
+                                mark_price: Some(String::new()),
+                                ..Default::default()
+                            });
+                        item.a = parse_f64(&t.ask1_price);
+                        item.b = parse_f64(&t.bid1_price);
+                        item.trade24_count = parse_f64(&t.turnover_24h);
+                    }
+                    tracing::info!(
+                        "bybit spot: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                }
+
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 10

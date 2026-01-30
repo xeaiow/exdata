@@ -91,6 +91,44 @@ async fn fetch_spot_instruments(client: &reqwest::Client) -> Vec<String> {
         .collect()
 }
 
+/// Fetch spot ticker snapshot so every symbol has bid/ask from the start.
+/// The WS `tickers` channel is push-on-change only, so illiquid symbols would stay at a=0/b=0.
+#[derive(Deserialize)]
+struct OkxTickersResponse {
+    data: Vec<OkxTickerItem>,
+}
+
+#[derive(Deserialize)]
+struct OkxTickerItem {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "askPx", default)]
+    ask_px: String,
+    #[serde(rename = "bidPx", default)]
+    bid_px: String,
+    #[serde(rename = "volCcy24h", default)]
+    vol_ccy_24h: String,
+}
+
+async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<OkxTickerItem> {
+    let url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("okx spot: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let body: OkxTickersResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("okx spot: tickers parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.data
+}
+
 /// Fetch swap instrument instIds (USDT settle, linear, live state).
 async fn fetch_swap_instruments(client: &reqwest::Client) -> Vec<String> {
     let url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
@@ -144,6 +182,36 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
             Ok((ws, _)) => {
                 attempt = 0;
                 tracing::info!("okx spot: connected");
+                // Seed bid/ask from REST before entering the WS loop
+                let spot_tickers = fetch_spot_tickers(&client).await;
+                if !spot_tickers.is_empty() {
+                    let instruments_set: HashSet<&String> = instruments.iter().collect();
+                    let mut section = cache.okx_spot.write().await;
+                    for t in &spot_tickers {
+                        if !instruments_set.contains(&t.inst_id) {
+                            continue;
+                        }
+                        let normalized = normalize_spot(&t.inst_id);
+                        let item = section
+                            .items
+                            .entry(normalized.clone())
+                            .or_insert_with(|| ExchangeItem {
+                                name: normalized,
+                                rate_interval: Some(0),
+                                rate: Some("--".to_string()),
+                                rate_max: Some("--".to_string()),
+                                ..Default::default()
+                            });
+                        item.a = parse_f64(&t.ask_px);
+                        item.b = parse_f64(&t.bid_px);
+                        item.trade24_count = parse_f64(&t.vol_ccy_24h);
+                    }
+                    tracing::info!(
+                        "okx spot: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                }
+
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 50 args per message

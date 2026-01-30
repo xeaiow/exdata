@@ -82,6 +82,43 @@ async fn fetch_spot_symbols(client: &reqwest::Client) -> Vec<String> {
         .collect()
 }
 
+/// Fetch spot ticker snapshot so every symbol has bid/ask from the start.
+/// The WS `ticker` channel is push-on-change only, so illiquid symbols would stay at a=0/b=0.
+#[derive(Deserialize)]
+struct SpotTickersResponse {
+    data: Vec<SpotTickerItem>,
+}
+
+#[derive(Deserialize)]
+struct SpotTickerItem {
+    symbol: String,
+    #[serde(rename = "askPr", default)]
+    ask_pr: String,
+    #[serde(rename = "bidPr", default)]
+    bid_pr: String,
+    #[serde(rename = "quoteVolume", default)]
+    quote_volume: String,
+}
+
+async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<SpotTickerItem> {
+    let url = "https://api.bitget.com/api/v2/spot/market/tickers";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("bitget spot: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let body: SpotTickersResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("bitget spot: tickers parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.data
+}
+
 /// Funding info for futures: symbol -> (interval_hours, rate_max_str).
 struct FuturesInstrumentData {
     symbols: Vec<String>,
@@ -163,6 +200,35 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
             Ok((ws, _)) => {
                 attempt = 0;
                 tracing::info!("bitget spot: connected");
+                // Seed bid/ask from REST before entering the WS loop
+                let spot_tickers = fetch_spot_tickers(&client).await;
+                if !spot_tickers.is_empty() {
+                    let symbols_set: HashSet<&String> = symbols.iter().collect();
+                    let mut section = cache.bitget_spot.write().await;
+                    for t in &spot_tickers {
+                        if !symbols_set.contains(&t.symbol) {
+                            continue;
+                        }
+                        let item = section
+                            .items
+                            .entry(t.symbol.clone())
+                            .or_insert_with(|| ExchangeItem {
+                                name: t.symbol.clone(),
+                                rate_max: Some("--".to_string()),
+                                index_price: Some(String::new()),
+                                mark_price: Some(String::new()),
+                                ..Default::default()
+                            });
+                        item.a = parse_f64(&t.ask_pr);
+                        item.b = parse_f64(&t.bid_pr);
+                        item.trade24_count = parse_f64(&t.quote_volume);
+                    }
+                    tracing::info!(
+                        "bitget spot: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                }
+
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 50 args per message
