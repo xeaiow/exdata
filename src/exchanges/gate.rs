@@ -207,6 +207,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                         "gate spot: seeded {} tickers from REST",
                         section.items.len()
                     );
+                    section.serialize_cache();
                 }
 
                 let (mut write, mut read) = ws.split();
@@ -311,6 +312,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                     item.a = parse_f64(lowest_ask);
                     item.b = parse_f64(highest_bid);
                     item.trade24_count = parse_f64(quote_volume);
+                    section.serialize_cache();
                 }
             }
             Err(e) => {
@@ -546,6 +548,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                             }
                                         }
                                     }
+                                    section.serialize_cache();
                                 }
                                 "futures.book_ticker" => {
                                     // futures.book_ticker result is a single object
@@ -600,6 +603,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                             item.rate_max = Some(max_rate.clone());
                                         }
                                     }
+                                    section.serialize_cache();
                                 }
                                 _ => {
                                     tracing::warn!("gate futures: unknown channel: {}", channel);
@@ -718,6 +722,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         removed_count
                                     );
                                 }
+                                section.serialize_cache();
                             }
 
                             current_symbols = new_symbols;

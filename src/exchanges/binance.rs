@@ -116,6 +116,7 @@ pub async fn run_spot(cache: SharedCache) {
                         item.b = parse_f64(&t.b);
                         item.trade24_count = parse_f64(&t.q);
                     }
+                    section.serialize_cache();
                 }
             }
             Err(e) => {
@@ -221,6 +222,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         "binance futures: seeded {} book tickers from REST",
                         section.items.len()
                     );
+                    section.serialize_cache();
                 }
 
                 let (_, mut read) = ws.split();
@@ -293,6 +295,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     item.rate_interval = Some(*interval);
                                     item.rate_max = Some(max_rate.clone());
                                 }
+                                section.serialize_cache();
                             } else if stream == "!ticker@arr" {
                                 // Array of ticker objects
                                 let tickers: Vec<FuturesTicker> =
@@ -325,6 +328,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         item.rate_max = Some(max_rate.clone());
                                     }
                                 }
+                                section.serialize_cache();
                             } else if stream.contains("markPrice") {
                                 // Array of markPriceUpdate objects
                                 let updates: Vec<MarkPriceUpdate> =
@@ -361,6 +365,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         item.rate_max = Some(max_rate.clone());
                                     }
                                 }
+                                section.serialize_cache();
                             } else {
                                 tracing::warn!("binance futures: unknown stream: {}", stream);
                             }
@@ -411,6 +416,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         );
                                     }
                                 }
+                                section.serialize_cache();
                             }
 
                             funding_info = new_funding;

@@ -210,6 +210,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                         "okx spot: seeded {} tickers from REST",
                         section.items.len()
                     );
+                    section.serialize_cache();
                 }
 
                 let (mut write, mut read) = ws.split();
@@ -334,6 +335,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             item.a = parse_f64(ask_px);
                             item.b = parse_f64(bid_px);
                             item.trade24_count = parse_f64(vol_ccy);
+                            section.serialize_cache();
                         }
                         _ = ping_interval.tick() => {
                             // OKX uses plain text "ping" for heartbeat
@@ -511,6 +513,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     item.a = parse_f64(ask_px);
                                     item.b = parse_f64(bid_px);
                                     item.trade24_count = parse_f64(vol_ccy);
+                                    section.serialize_cache();
                                 }
                                 "funding-rate" => {
                                     let inst_id = data
@@ -558,6 +561,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     if interval > 0 {
                                         item.rate_interval = Some(interval);
                                     }
+                                    section.serialize_cache();
                                 }
                                 _ => {
                                     tracing::warn!(
@@ -674,6 +678,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         removed_count
                                     );
                                 }
+                                section.serialize_cache();
                             }
 
                             current_instruments = new_instruments;

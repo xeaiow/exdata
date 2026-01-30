@@ -275,6 +275,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                         "bybit spot: seeded {} tickers from REST",
                         section.items.len()
                     );
+                    section.serialize_cache();
                 }
 
                 let (mut write, mut read) = ws.split();
@@ -382,6 +383,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             if let Some(ref v) = ticker.turnover_24h {
                                 item.trade24_count = parse_f64(v);
                             }
+                            section.serialize_cache();
                         }
                         _ = ping_interval.tick() => {
                             let ping = serde_json::json!({"op": "ping"});
@@ -565,6 +567,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     item.rate_max = Some(max_rate.clone());
                                 }
                             }
+                            section.serialize_cache();
                         }
                         _ = ping_interval.tick() => {
                             let ping = serde_json::json!({"op": "ping"});
@@ -649,6 +652,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         removed_count
                                     );
                                 }
+                                section.serialize_cache();
                             }
 
                             current_symbols = new_symbols;

@@ -227,6 +227,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                         "bitget spot: seeded {} tickers from REST",
                         section.items.len()
                     );
+                    section.serialize_cache();
                 }
 
                 let (mut write, mut read) = ws.split();
@@ -353,6 +354,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             item.a = parse_f64(ask_pr);
                             item.b = parse_f64(bid_pr);
                             item.trade24_count = parse_f64(quote_volume);
+                            section.serialize_cache();
                         }
                         _ = ping_interval.tick() => {
                             // Bitget uses plain text "ping" for heartbeat
@@ -564,6 +566,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     item.rate_max = Some(max_rate.clone());
                                 }
                             }
+                            section.serialize_cache();
                         }
                         _ = ping_interval.tick() => {
                             // Bitget uses plain text "ping" for heartbeat
@@ -664,6 +667,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         removed_count
                                     );
                                 }
+                                section.serialize_cache();
                             }
 
                             current_symbols = new_symbols;
