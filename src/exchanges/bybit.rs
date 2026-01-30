@@ -30,6 +30,8 @@ struct InstrumentInfo {
     contract_type: Option<String>,
     #[serde(rename = "fundingInterval", default)]
     funding_interval: Option<u64>,
+    #[serde(rename = "upperFundingRate", default)]
+    upper_funding_rate: Option<String>,
 }
 
 // ── WS serde structs ────────────────────────────────────────────────────────
@@ -155,9 +157,17 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
             if info.quote_coin == "USDT" && info.status == "Trading" && is_perp {
                 symbols.push(info.symbol.clone());
                 let interval_hours = info.funding_interval.unwrap_or(480) / 60;
+                let rate_max = info
+                    .upper_funding_rate
+                    .as_deref()
+                    .map(|s| {
+                        let v = parse_f64(s);
+                        format!("{:.3}", v * 100.0)
+                    })
+                    .unwrap_or_else(|| "--".to_string());
                 funding_info.insert(
                     info.symbol.clone(),
-                    (interval_hours as u32, "--".to_string()),
+                    (interval_hours as u32, rate_max),
                 );
             }
         }

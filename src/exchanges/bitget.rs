@@ -29,13 +29,10 @@ struct FuturesContractsResponse {
 #[derive(Deserialize)]
 struct FuturesContractInfo {
     symbol: String,
+    #[serde(rename = "symbolStatus")]
     status: String,
-    #[serde(rename = "quoteCoin")]
-    quote_coin: String,
-    #[serde(rename = "fundingIntervalHours", default)]
-    funding_interval_hours: Option<String>,
-    #[serde(rename = "maxFundingRate", default)]
-    max_funding_rate: Option<String>,
+    #[serde(rename = "fundInterval", default)]
+    fund_interval: Option<String>,
 }
 
 // ── WS serde structs ────────────────────────────────────────────────────────
@@ -125,19 +122,13 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> FuturesInstrumentD
         }
 
         let interval_hours: u32 = contract
-            .funding_interval_hours
+            .fund_interval
             .as_deref()
             .unwrap_or("8")
             .parse()
             .unwrap_or(8);
 
-        let rate_max_str = match contract.max_funding_rate {
-            Some(ref s) => {
-                let val = parse_f64(s);
-                format!("{:.3}", val * 100.0)
-            }
-            None => "--".to_string(),
-        };
+        let rate_max_str = "--".to_string();
 
         symbols.push(contract.symbol.clone());
         funding_info.insert(contract.symbol, (interval_hours, rate_max_str));
