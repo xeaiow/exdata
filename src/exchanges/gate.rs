@@ -23,7 +23,7 @@ struct FuturesContract {
     in_delisting: bool,
     funding_interval: u64,
     #[serde(default)]
-    funding_cap_ratio: Option<f64>,
+    funding_cap_ratio: Option<String>,
 }
 
 /// Contract info from REST: (rate_interval_hours, rate_max_pct)
@@ -114,7 +114,7 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
 
         let interval_hours = (c.funding_interval / 3600) as u32;
         let rate_max = match c.funding_cap_ratio {
-            Some(cap) => format!("{:.3}", cap * 100.0),
+            Some(ref cap) => format!("{:.3}", parse_f64(cap) * 100.0),
             None => "--".to_string(),
         };
 
