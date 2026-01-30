@@ -6,6 +6,7 @@ mod models;
 use axum::{Router, routing::get};
 use cache::{Cache, SharedCache};
 use std::sync::Arc;
+use tower_http::compression::CompressionLayer;
 
 #[tokio::main]
 async fn main() {
@@ -28,6 +29,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/exdata", get(api::get_exdata))
+        .layer(CompressionLayer::new())
         .with_state(cache);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
