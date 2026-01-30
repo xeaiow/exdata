@@ -75,7 +75,7 @@ pub async fn run_spot(cache: SharedCache) {
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            tracing::error!("binance spot: read error: {}", e);
+                            tracing::warn!("binance spot: read error: {}", e);
                             break;
                         }
                     };
@@ -180,7 +180,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            tracing::error!("binance futures: read error: {}", e);
+                            tracing::warn!("binance futures: read error: {}", e);
                             break;
                         }
                     };

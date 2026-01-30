@@ -177,7 +177,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::error!("okx spot: read error: {}", e);
+                                    tracing::warn!("okx spot: read error: {}", e);
                                     break;
                                 }
                                 None => {
@@ -349,7 +349,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::error!("okx futures: read error: {}", e);
+                                    tracing::warn!("okx futures: read error: {}", e);
                                     break;
                                 }
                                 None => {

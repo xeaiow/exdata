@@ -184,7 +184,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            tracing::error!("gate spot: read error: {}", e);
+                            tracing::warn!("gate spot: read error: {}", e);
                             break;
                         }
                     };
@@ -345,7 +345,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            tracing::error!("gate futures: read error: {}", e);
+                            tracing::warn!("gate futures: read error: {}", e);
                             break;
                         }
                     };
