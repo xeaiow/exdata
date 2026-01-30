@@ -450,22 +450,25 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     );
                                 }
 
-                                // Seed bid/ask for any new symbols
+                                // Seed bid/ask for new symbols and update existing items with a=0
+                                let seed_ts = now_ms();
                                 for bt in &new_book {
                                     if !bt.symbol.ends_with("USDT") {
                                         continue;
                                     }
-                                    if !section.items.contains_key(&bt.symbol) {
-                                        section.items.insert(
-                                            bt.symbol.clone(),
-                                            ExchangeItem {
-                                                name: bt.symbol.clone(),
-                                                ts: now_ms(),
-                                                a: parse_f64(&bt.ask_price),
-                                                b: parse_f64(&bt.bid_price),
-                                                ..Default::default()
-                                            },
-                                        );
+                                    let item = section
+                                        .items
+                                        .entry(bt.symbol.clone())
+                                        .or_insert_with(|| ExchangeItem {
+                                            name: bt.symbol.clone(),
+                                            ..Default::default()
+                                        });
+                                    // Only seed from REST if bid/ask is still zero
+                                    // (avoid overwriting fresher WS data)
+                                    if item.a == 0.0 && item.b == 0.0 {
+                                        item.a = parse_f64(&bt.ask_price);
+                                        item.b = parse_f64(&bt.bid_price);
+                                        item.ts = seed_ts;
                                     }
                                 }
                                 section.serialize_cache();

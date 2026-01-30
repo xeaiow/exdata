@@ -110,6 +110,36 @@ async fn fetch_spot_tickers(client: &reqwest::Client) -> Vec<GateSpotTicker> {
     }
 }
 
+/// Fetch futures ticker snapshot so every symbol has bid/ask from the start.
+#[derive(Deserialize)]
+struct GateFuturesTicker {
+    contract: String,
+    #[serde(default)]
+    lowest_ask: String,
+    #[serde(default)]
+    highest_bid: String,
+    #[serde(default)]
+    volume_24h_quote: String,
+}
+
+async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<GateFuturesTicker> {
+    let url = "https://api.gateio.ws/api/v4/futures/usdt/tickers";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("gate futures: tickers fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("gate futures: tickers parse failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Fetch futures contracts: NOT in_delisting.
 async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
     let url = "https://api.gateio.ws/api/v4/futures/usdt/contracts";
@@ -418,6 +448,44 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
+                // Seed bid/ask from REST
+                let futures_tickers = fetch_futures_tickers(&client).await;
+                if !futures_tickers.is_empty() {
+                    let ts = now_ms();
+                    let mut section = cache.gate_future.write().await;
+                    for t in &futures_tickers {
+                        if !current_symbols.contains(&t.contract) {
+                            continue;
+                        }
+                        let normalized = normalize_symbol(&t.contract);
+                        let item = section
+                            .items
+                            .entry(normalized.clone())
+                            .or_insert_with(|| {
+                                let mut ei = ExchangeItem {
+                                    name: normalized,
+                                    ..Default::default()
+                                };
+                                if let Some((interval, max_rate)) =
+                                    funding_info.get(&t.contract)
+                                {
+                                    ei.rate_interval = Some(*interval);
+                                    ei.rate_max = Some(max_rate.clone());
+                                }
+                                ei
+                            });
+                        item.a = parse_f64(&t.lowest_ask);
+                        item.b = parse_f64(&t.highest_bid);
+                        item.ts = ts;
+                        item.trade24_count = parse_f64(&t.volume_24h_quote);
+                    }
+                    tracing::info!(
+                        "gate futures: seeded {} tickers from REST",
+                        section.items.len()
+                    );
+                    section.serialize_cache();
+                }
+
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
                 refresh_interval.tick().await; // consume the immediate first tick
@@ -577,9 +645,9 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     section.serialize_cache();
                                 }
                                 "futures.book_ticker" => {
-                                    // futures.book_ticker result is a single object
+                                    // futures.book_ticker result uses "s" for contract name
                                     let contract = result
-                                        .get("contract")
+                                        .get("s")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     if contract.is_empty() {
