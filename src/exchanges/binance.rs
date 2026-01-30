@@ -9,14 +9,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 // ── Serde structs ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct SpotTicker {
-    s: String,
-    a: String,
-    b: String,
-    q: String,
-}
-
-#[derive(Deserialize)]
 struct CombinedMsg {
     stream: String,
     data: serde_json::Value,
@@ -59,104 +51,6 @@ struct RestBookTicker {
     bid_price: String,
     #[serde(rename = "askPrice")]
     ask_price: String,
-}
-
-// ── Spot ────────────────────────────────────────────────────────────────────
-
-pub async fn run_spot(cache: SharedCache) {
-    let mut attempt: u32 = 0;
-    loop {
-        tracing::info!("binance spot: connecting...");
-        let url = "wss://stream.binance.com:9443/ws/!ticker@arr";
-        match connect_async(url).await {
-            Ok((ws, _)) => {
-                attempt = 0;
-                tracing::info!("binance spot: connected");
-                let (mut write, mut read) = ws.split();
-
-                let mut ping_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(30));
-                ping_interval.tick().await; // consume the immediate first tick
-
-                let mut read_deadline =
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-
-                loop {
-                    tokio::select! {
-                        msg = read.next() => {
-                            read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                            let msg = match msg {
-                                Some(Ok(m)) => m,
-                                Some(Err(e)) => {
-                                    tracing::warn!("binance spot: read error: {}", e);
-                                    break;
-                                }
-                                None => {
-                                    tracing::warn!("binance spot: stream ended");
-                                    break;
-                                }
-                            };
-
-                            let text = match msg {
-                                Message::Text(t) => t,
-                                Message::Ping(_) | Message::Pong(_) => continue,
-                                Message::Close(_) => {
-                                    tracing::warn!("binance spot: server closed connection");
-                                    break;
-                                }
-                                _ => continue,
-                            };
-
-                            let tickers: Vec<SpotTicker> = match serde_json::from_str(&text) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!("binance spot: parse error: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            let ts = now_ms();
-                            let mut section = cache.binance_spot.write().await;
-                            section.ts = ts;
-
-                            for t in &tickers {
-                                if !t.s.ends_with("USDT") {
-                                    continue;
-                                }
-                                let item = section
-                                    .items
-                                    .entry(t.s.clone())
-                                    .or_insert_with(|| ExchangeItem {
-                                        name: t.s.clone(),
-                                        ..Default::default()
-                                    });
-                                item.a = parse_f64(&t.a);
-                                item.b = parse_f64(&t.b);
-                                item.ts = ts;
-                                item.trade24_count = parse_f64(&t.q);
-                            }
-                            section.serialize_cache();
-                        }
-                        _ = ping_interval.tick() => {
-                            if let Err(e) = write.send(Message::Ping(vec![].into())).await {
-                                tracing::error!("binance spot: ping send error: {}", e);
-                                break;
-                            }
-                        }
-                        _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("binance spot: no message for 30s, reconnecting");
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("binance spot: connection failed: {}", e);
-            }
-        }
-        backoff_sleep(attempt).await;
-        attempt = attempt.saturating_add(1);
-    }
 }
 
 // ── Futures helpers ─────────────────────────────────────────────────────────

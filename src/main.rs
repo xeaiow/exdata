@@ -15,16 +15,11 @@ async fn main() {
     let cache: SharedCache = Arc::new(Cache::new());
     let client = reqwest::Client::new();
 
-    // Spawn exchange tasks (10 total)
-    tokio::spawn(exchanges::binance::run_spot(cache.clone()));
+    // Spawn exchange tasks (5 futures only)
     tokio::spawn(exchanges::binance::run_future(cache.clone(), client.clone()));
-    tokio::spawn(exchanges::bybit::run_spot(cache.clone(), client.clone()));
     tokio::spawn(exchanges::bybit::run_future(cache.clone(), client.clone()));
-    tokio::spawn(exchanges::okx::run_spot(cache.clone(), client.clone()));
     tokio::spawn(exchanges::okx::run_future(cache.clone(), client.clone()));
-    tokio::spawn(exchanges::gate::run_spot(cache.clone(), client.clone()));
     tokio::spawn(exchanges::gate::run_future(cache.clone(), client.clone()));
-    tokio::spawn(exchanges::bitget::run_spot(cache.clone(), client.clone()));
     tokio::spawn(exchanges::bitget::run_future(cache.clone(), client.clone()));
 
     let app = Router::new()
