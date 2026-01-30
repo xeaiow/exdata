@@ -283,6 +283,9 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 .entry(inst_id.to_string())
                                 .or_insert_with(|| ExchangeItem {
                                     name: inst_id.to_string(),
+                                    rate_max: Some("--".to_string()),
+                                    index_price: Some(String::new()),
+                                    mark_price: Some(String::new()),
                                     ..Default::default()
                                 });
                             item.a = parse_f64(ask_pr);

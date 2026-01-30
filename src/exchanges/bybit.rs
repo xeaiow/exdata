@@ -301,6 +301,8 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 .entry(ticker.symbol.clone())
                                 .or_insert_with(|| ExchangeItem {
                                     name: ticker.symbol.clone(),
+                                    index_price: Some(String::new()),
+                                    mark_price: Some(String::new()),
                                     ..Default::default()
                                 });
 

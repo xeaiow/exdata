@@ -261,6 +261,9 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 .entry(normalized.clone())
                                 .or_insert_with(|| ExchangeItem {
                                     name: normalized,
+                                    rate_interval: Some(0),
+                                    rate: Some("--".to_string()),
+                                    rate_max: Some("--".to_string()),
                                     ..Default::default()
                                 });
                             item.a = parse_f64(ask_px);
@@ -314,31 +317,16 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 tracing::info!("okx futures: connected");
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for all 4 channels.
-                // tickers, funding-rate, mark-price use the swap instId (e.g. "BTC-USDT-SWAP")
-                // index-tickers uses the base instId (e.g. "BTC-USDT")
+                // Build subscription args for tickers + funding-rate channels.
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
                 for inst_id in &instruments {
-                    // tickers channel
                     all_args.push(serde_json::json!({
                         "channel": "tickers",
                         "instId": inst_id
                     }));
-                    // funding-rate channel
                     all_args.push(serde_json::json!({
                         "channel": "funding-rate",
                         "instId": inst_id
-                    }));
-                    // mark-price channel
-                    all_args.push(serde_json::json!({
-                        "channel": "mark-price",
-                        "instId": inst_id
-                    }));
-                    // index-tickers channel: uses base instId without "-SWAP"
-                    let base_id = inst_id.strip_suffix("-SWAP").unwrap_or(inst_id);
-                    all_args.push(serde_json::json!({
-                        "channel": "index-tickers",
-                        "instId": base_id
                     }));
                 }
 
@@ -470,6 +458,24 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     let rate_dec = parse_f64(funding_rate);
                                     let rate_str = format!("{:.3}", rate_dec * 100.0);
 
+                                    // Extract maxFundingRate
+                                    let max_rate = data
+                                        .get("maxFundingRate")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| format!("{:.3}", parse_f64(s) * 100.0))
+                                        .unwrap_or_else(|| "--".to_string());
+
+                                    // Calculate interval from fundingTime and nextFundingTime
+                                    let interval = {
+                                        let ft = data.get("fundingTime").and_then(|v| v.as_str()).map(|s| parse_f64(s) as u64).unwrap_or(0);
+                                        let nft = data.get("nextFundingTime").and_then(|v| v.as_str()).map(|s| parse_f64(s) as u64).unwrap_or(0);
+                                        if nft > ft && ft > 0 {
+                                            ((nft - ft) / 3_600_000) as u32
+                                        } else {
+                                            0
+                                        }
+                                    };
+
                                     let mut section = cache.okx_future.write().await;
                                     section.ts = ts;
                                     let item = section
@@ -477,63 +483,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         .entry(normalized.clone())
                                         .or_insert_with(|| ExchangeItem {
                                             name: normalized,
-                                            rate_interval: Some(0),
-                                            rate_max: Some("--".to_string()),
                                             ..Default::default()
                                         });
                                     item.rate = Some(rate_str);
-                                }
-                                "mark-price" => {
-                                    let inst_id = data
-                                        .get("instId")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&arg.inst_id);
-                                    let normalized = normalize_swap(inst_id);
-
-                                    let mark_px = data
-                                        .get("markPx")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
-
-                                    let mut section = cache.okx_future.write().await;
-                                    section.ts = ts;
-                                    let item = section
-                                        .items
-                                        .entry(normalized.clone())
-                                        .or_insert_with(|| ExchangeItem {
-                                            name: normalized,
-                                            rate_interval: Some(0),
-                                            rate_max: Some("--".to_string()),
-                                            ..Default::default()
-                                        });
-                                    item.mark_price = Some(mark_px.to_string());
-                                }
-                                "index-tickers" => {
-                                    // index-tickers instId is "BTC-USDT" (no -SWAP),
-                                    // normalize by just removing hyphens
-                                    let inst_id = data
-                                        .get("instId")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&arg.inst_id);
-                                    let normalized = remove_hyphens(inst_id);
-
-                                    let idx_px = data
-                                        .get("idxPx")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
-
-                                    let mut section = cache.okx_future.write().await;
-                                    section.ts = ts;
-                                    let item = section
-                                        .items
-                                        .entry(normalized.clone())
-                                        .or_insert_with(|| ExchangeItem {
-                                            name: normalized,
-                                            rate_interval: Some(0),
-                                            rate_max: Some("--".to_string()),
-                                            ..Default::default()
-                                        });
-                                    item.index_price = Some(idx_px.to_string());
+                                    item.rate_max = Some(max_rate);
+                                    if interval > 0 {
+                                        item.rate_interval = Some(interval);
+                                    }
                                 }
                                 _ => {
                                     tracing::warn!(
