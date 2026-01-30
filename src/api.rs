@@ -44,7 +44,10 @@ pub async fn get_exdata(State(cache): State<SharedCache>) -> Response {
 
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=1")),
+        ],
         body,
     ).into_response()
 }
