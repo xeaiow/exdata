@@ -21,6 +21,7 @@ async fn main() {
     tokio::spawn(exchanges::okx::run_future(cache.clone(), client.clone()));
     tokio::spawn(exchanges::gate::run_future(cache.clone(), client.clone()));
     tokio::spawn(exchanges::bitget::run_future(cache.clone(), client.clone()));
+    tokio::spawn(exchanges::zoomex::run_future(cache.clone(), client.clone()));
 
     let app = Router::new()
         .route("/api/exdata", get(api::get_exdata))

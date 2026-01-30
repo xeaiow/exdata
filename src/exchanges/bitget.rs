@@ -63,7 +63,7 @@ struct SpotTickerItem {
 
 async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<SpotTickerItem> {
     let url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("bitget futures: tickers fetch failed: {}", e);
@@ -89,7 +89,7 @@ struct FuturesInstrumentData {
 /// Fetch futures contracts (USDT-FUTURES, normal status).
 async fn fetch_futures_contracts(client: &reqwest::Client) -> FuturesInstrumentData {
     let url = "https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("bitget futures: contracts request failed: {}", e);
@@ -138,8 +138,9 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> FuturesInstrumentD
     }
 }
 
-// ── Futures ─────────────────────────────────────────────────────────────────
+// ── Futures (coordinator + chunk workers) ───────────────────────────────────
 
+/// Coordinator: fetches contracts, seeds REST, spawns chunk workers, restarts every 5 min.
 pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
     let mut attempt: u32 = 0;
 
@@ -157,22 +158,109 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             attempt = attempt.saturating_add(1);
             continue;
         }
+        attempt = 0;
 
-        let mut funding_info = instr.funding_info;
-        let mut current_symbols: HashSet<String> =
-            instr.symbols.iter().cloned().collect();
+        let current_symbols: HashSet<String> = instr.symbols.iter().cloned().collect();
 
-        tracing::info!("bitget futures: connecting...");
+        // Seed bid/ask from REST
+        let futures_tickers = fetch_futures_tickers(&client).await;
+        if !futures_tickers.is_empty() {
+            let ts = now_ms();
+            let mut section = cache.bitget_future.write().await;
+            for t in &futures_tickers {
+                if !current_symbols.contains(&t.symbol) {
+                    continue;
+                }
+                let item = section
+                    .items
+                    .entry(t.symbol.clone())
+                    .or_insert_with(|| {
+                        let mut ei = ExchangeItem {
+                            name: t.symbol.clone(),
+                            ..Default::default()
+                        };
+                        if let Some((interval, max_rate)) = instr.funding_info.get(&t.symbol) {
+                            ei.rate_interval = Some(*interval);
+                            ei.rate_max = Some(max_rate.clone());
+                        }
+                        ei
+                    });
+                item.a = parse_f64(&t.ask_pr);
+                item.b = parse_f64(&t.bid_pr);
+                item.ts = ts;
+                item.trade24_count = parse_f64(&t.quote_volume);
+            }
+            tracing::info!(
+                "bitget futures: seeded {} tickers from REST",
+                section.items.len()
+            );
+            section.serialize_cache();
+        }
+
+        // Split symbols into chunks of 50 and spawn a worker for each
+        let funding_info = std::sync::Arc::new(instr.funding_info);
+        let chunks: Vec<Vec<String>> = instr
+            .symbols
+            .chunks(50)
+            .map(|c| c.to_vec())
+            .collect();
+        let num_chunks = chunks.len();
+        tracing::info!(
+            "bitget futures: spawning {} chunk workers ({} symbols)",
+            num_chunks,
+            instr.symbols.len()
+        );
+
+        let mut handles = Vec::with_capacity(num_chunks);
+        for (idx, chunk_symbols) in chunks.into_iter().enumerate() {
+            let cache = cache.clone();
+            let funding = funding_info.clone();
+            let handle = tokio::spawn(run_chunk(cache, chunk_symbols, funding, idx));
+            handles.push(handle);
+        }
+
+        // Sleep 5 minutes, then abort all chunks and restart
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+
+        tracing::info!("bitget futures: coordinator restarting, aborting {} chunks", handles.len());
+        for h in &handles {
+            h.abort();
+        }
+        // Wait for all to finish (aborted or otherwise)
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Clear cache before full restart
+        cache.bitget_future.write().await.clear();
+    }
+}
+
+/// Chunk worker: manages a single WS connection subscribing to ≤50 symbols.
+/// Self-reconnects on disconnect; no refresh logic (coordinator handles that).
+async fn run_chunk(
+    cache: SharedCache,
+    symbols: Vec<String>,
+    funding_info: std::sync::Arc<HashMap<String, (u32, String)>>,
+    chunk_id: usize,
+) {
+    let mut attempt: u32 = 0;
+
+    loop {
+        tracing::info!("bitget futures chunk-{}: connecting ({} symbols)...", chunk_id, symbols.len());
         let url = "wss://ws.bitget.com/v2/ws/public";
-        match connect_async(url).await {
-            Ok((ws, _)) => {
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async(url),
+        ).await;
+        match ws_result {
+            Ok(Ok((ws, _))) => {
                 attempt = 0;
-                tracing::info!("bitget futures: connected");
+                tracing::info!("bitget futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Subscribe in batches of 50 args per message
-                let args_all: Vec<serde_json::Value> = instr
-                    .symbols
+                // Subscribe all symbols in one batch (≤50)
+                let args: Vec<serde_json::Value> = symbols
                     .iter()
                     .map(|s| {
                         serde_json::json!({
@@ -182,52 +270,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         })
                     })
                     .collect();
-
-                for chunk in args_all.chunks(50) {
-                    let sub = serde_json::json!({
-                        "op": "subscribe",
-                        "args": chunk
-                    });
-                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("bitget futures: subscribe send error: {}", e);
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-
-                // Seed bid/ask from REST
-                let futures_tickers = fetch_futures_tickers(&client).await;
-                if !futures_tickers.is_empty() {
-                    let ts = now_ms();
-                    let mut section = cache.bitget_future.write().await;
-                    for t in &futures_tickers {
-                        if !current_symbols.contains(&t.symbol) {
-                            continue;
-                        }
-                        let item = section
-                            .items
-                            .entry(t.symbol.clone())
-                            .or_insert_with(|| {
-                                let mut ei = ExchangeItem {
-                                    name: t.symbol.clone(),
-                                    ..Default::default()
-                                };
-                                if let Some((interval, max_rate)) = funding_info.get(&t.symbol) {
-                                    ei.rate_interval = Some(*interval);
-                                    ei.rate_max = Some(max_rate.clone());
-                                }
-                                ei
-                            });
-                        item.a = parse_f64(&t.ask_pr);
-                        item.b = parse_f64(&t.bid_pr);
-                        item.ts = ts;
-                        item.trade24_count = parse_f64(&t.quote_volume);
-                    }
-                    tracing::info!(
-                        "bitget futures: seeded {} tickers from REST",
-                        section.items.len()
-                    );
-                    section.serialize_cache();
+                let sub = serde_json::json!({
+                    "op": "subscribe",
+                    "args": args
+                });
+                if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                    tracing::error!("bitget futures chunk-{}: subscribe send error: {}", chunk_id, e);
+                    backoff_sleep(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
                 }
 
                 let mut ping_interval =
@@ -236,10 +287,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
-                let mut refresh_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(300));
-                refresh_interval.tick().await; // consume the immediate first tick
-
                 loop {
                     tokio::select! {
                         msg = read.next() => {
@@ -247,11 +294,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::warn!("bitget futures: read error: {}", e);
+                                    tracing::warn!("bitget futures chunk-{}: read error: {}", chunk_id, e);
                                     break;
                                 }
                                 None => {
-                                    tracing::warn!("bitget futures: stream ended");
+                                    tracing::warn!("bitget futures chunk-{}: stream ended", chunk_id);
                                     break;
                                 }
                             };
@@ -260,7 +307,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Text(t) => t,
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
-                                    tracing::warn!("bitget futures: server closed connection");
+                                    tracing::warn!("bitget futures chunk-{}: server closed connection", chunk_id);
                                     break;
                                 }
                                 _ => continue,
@@ -276,7 +323,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ws_msg: WsMsg = match serde_json::from_str(text_str) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("bitget futures: parse error: {}", e);
+                                    tracing::warn!("bitget futures chunk-{}: parse error: {}", chunk_id, e);
                                     continue;
                                 }
                             };
@@ -345,7 +392,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         name: inst_id.to_string(),
                                         ..Default::default()
                                     };
-                                    // Apply funding info from REST
                                     if let Some((interval, max_rate)) = funding_info.get(inst_id) {
                                         ei.rate_interval = Some(*interval);
                                         ei.rate_max = Some(max_rate.clone());
@@ -371,121 +417,27 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             section.serialize_cache();
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("bitget futures: no message for 30s, reconnecting");
+                            tracing::warn!("bitget futures chunk-{}: no message for 30s, reconnecting", chunk_id);
                             break;
                         }
                         _ = ping_interval.tick() => {
                             // Bitget uses plain text "ping" for heartbeat
                             if let Err(e) = write.send(Message::Text("ping".into())).await {
-                                tracing::error!("bitget futures: ping send error: {}", e);
+                                tracing::error!("bitget futures chunk-{}: ping send error: {}", chunk_id, e);
                                 break;
                             }
-                        }
-                        _ = refresh_interval.tick() => {
-                            tracing::info!("bitget futures: refreshing contracts list...");
-                            let new_instr = fetch_futures_contracts(&client).await;
-                            if new_instr.symbols.is_empty() {
-                                tracing::warn!("bitget futures: refresh returned empty list, skipping");
-                                continue;
-                            }
-
-                            let new_symbols: HashSet<String> =
-                                new_instr.symbols.iter().cloned().collect();
-                            tracing::info!(
-                                "bitget futures: refresh found {} contracts",
-                                new_symbols.len()
-                            );
-
-                            // Unsubscribe removed symbols
-                            let removed: Vec<String> = current_symbols
-                                .difference(&new_symbols)
-                                .cloned()
-                                .collect();
-                            if !removed.is_empty() {
-                                tracing::info!(
-                                    "bitget futures: unsubscribing {} removed symbols",
-                                    removed.len()
-                                );
-                                let unsub_args: Vec<serde_json::Value> = removed
-                                    .iter()
-                                    .map(|s| {
-                                        serde_json::json!({
-                                            "instType": "USDT-FUTURES",
-                                            "channel": "ticker",
-                                            "instId": s
-                                        })
-                                    })
-                                    .collect();
-                                for chunk in unsub_args.chunks(50) {
-                                    let unsub = serde_json::json!({
-                                        "op": "unsubscribe",
-                                        "args": chunk
-                                    });
-                                    if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
-                                        tracing::error!("bitget futures: unsub send error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Subscribe new symbols
-                            let added: Vec<String> = new_symbols
-                                .difference(&current_symbols)
-                                .cloned()
-                                .collect();
-                            if !added.is_empty() {
-                                tracing::info!(
-                                    "bitget futures: subscribing {} new symbols",
-                                    added.len()
-                                );
-                                let sub_args: Vec<serde_json::Value> = added
-                                    .iter()
-                                    .map(|s| {
-                                        serde_json::json!({
-                                            "instType": "USDT-FUTURES",
-                                            "channel": "ticker",
-                                            "instId": s
-                                        })
-                                    })
-                                    .collect();
-                                for chunk in sub_args.chunks(50) {
-                                    let sub = serde_json::json!({
-                                        "op": "subscribe",
-                                        "args": chunk
-                                    });
-                                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                                        tracing::error!("bitget futures: sub send error: {}", e);
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            }
-
-                            // Clean stale cache entries (Bitget symbols are already normalized)
-                            {
-                                let mut section = cache.bitget_future.write().await;
-                                let before = section.items.len();
-                                section.items.retain(|k, _| new_symbols.contains(k));
-                                let removed_count = before - section.items.len();
-                                if removed_count > 0 {
-                                    tracing::info!(
-                                        "bitget futures: removed {} stale cache entries",
-                                        removed_count
-                                    );
-                                }
-                                section.serialize_cache();
-                            }
-
-                            current_symbols = new_symbols;
-                            funding_info = new_instr.funding_info;
                         }
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("bitget futures: connection failed: {}", e);
+            Ok(Err(e)) => {
+                tracing::error!("bitget futures chunk-{}: connection failed: {}", chunk_id, e);
+            }
+            Err(_) => {
+                tracing::error!("bitget futures chunk-{}: connection timed out", chunk_id);
             }
         }
+        // Don't clear cache here — other chunks are still running
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }

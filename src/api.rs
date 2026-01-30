@@ -4,15 +4,16 @@ use axum::response::{IntoResponse, Response};
 use crate::cache::SharedCache;
 
 pub async fn get_exdata(State(cache): State<SharedCache>) -> Response {
-    let (bf, byf, of, gf, bgf) = tokio::join!(
+    let (bf, byf, of, gf, bgf, zf) = tokio::join!(
         async { cache.binance_future.read().await.cached_json.clone() },
         async { cache.bybit_future.read().await.cached_json.clone() },
         async { cache.okx_future.read().await.cached_json.clone() },
         async { cache.gate_future.read().await.cached_json.clone() },
         async { cache.bitget_future.read().await.cached_json.clone() },
+        async { cache.zoomex_future.read().await.cached_json.clone() },
     );
 
-    let cap = 100 + bf.len() + byf.len() + of.len() + gf.len() + bgf.len();
+    let cap = 120 + bf.len() + byf.len() + of.len() + gf.len() + bgf.len() + zf.len();
     let mut body = String::with_capacity(cap);
     body.push_str(r#"{"code":0,"data":{"binanceFuture":"#);
     body.push_str(&bf);
@@ -24,6 +25,8 @@ pub async fn get_exdata(State(cache): State<SharedCache>) -> Response {
     body.push_str(&gf);
     body.push_str(r#","bitgetFuture":"#);
     body.push_str(&bgf);
+    body.push_str(r#","zoomexFuture":"#);
+    body.push_str(&zf);
     body.push_str("}}");
 
     (

@@ -58,7 +58,7 @@ struct GateFuturesTicker {
 
 async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<GateFuturesTicker> {
     let url = "https://api.gateio.ws/api/v4/futures/usdt/tickers";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("gate futures: tickers fetch failed: {}", e);
@@ -77,7 +77,7 @@ async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<GateFuturesTicke
 /// Fetch futures contracts: NOT in_delisting.
 async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
     let url = "https://api.gateio.ws/api/v4/futures/usdt/contracts";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("gate futures: contracts request failed: {}", e);
@@ -149,8 +149,12 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
         tracing::info!("gate futures: connecting...");
         let url = "wss://fx-ws.gateio.ws/v4/ws/usdt";
-        match connect_async(url).await {
-            Ok((ws, _)) => {
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async(url),
+        ).await;
+        match ws_result {
+            Ok(Ok((ws, _))) => {
                 attempt = 0;
                 tracing::info!("gate futures: connected");
                 let (mut write, mut read) = ws.split();
@@ -236,6 +240,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
                 refresh_interval.tick().await; // consume the immediate first tick
+
+                let mut ping_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(15));
+                ping_interval.tick().await; // consume the immediate first tick
 
                 // Read loop
                 let mut read_deadline =
@@ -456,6 +464,20 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             tracing::warn!("gate futures: no message for 30s, reconnecting");
                             break;
                         }
+                        _ = ping_interval.tick() => {
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let ping = serde_json::json!({
+                                "time": now_secs,
+                                "channel": "futures.ping"
+                            });
+                            if let Err(e) = write.send(Message::Text(ping.to_string().into())).await {
+                                tracing::error!("gate futures: ping send error: {}", e);
+                                break;
+                            }
+                        }
                         _ = refresh_interval.tick() => {
                             tracing::info!("gate futures: refreshing contracts list...");
                             let new_contract_info = fetch_futures_contracts(&client).await;
@@ -577,10 +599,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!("gate futures: connection failed: {}", e);
             }
+            Err(_) => {
+                tracing::error!("gate futures: connection timed out");
+            }
         }
+        // Clear cache on disconnect to prevent stale data
+        cache.gate_future.write().await.clear();
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }

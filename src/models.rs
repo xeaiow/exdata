@@ -43,6 +43,14 @@ impl ExchangeSection {
         s
     }
 
+    /// Clear all items and reset timestamp, then re-serialize.
+    /// Call on WS disconnect to prevent stale data from being served.
+    pub fn clear(&mut self) {
+        self.ts = 0;
+        self.items.clear();
+        self.serialize_cache();
+    }
+
     /// Re-serialize the section to JSON. Call after every batch of updates.
     pub fn serialize_cache(&mut self) {
         #[derive(Serialize)]

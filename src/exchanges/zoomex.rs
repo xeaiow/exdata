@@ -90,18 +90,18 @@ struct RestTickerItem {
 }
 
 async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<RestTickerItem> {
-    let url = "https://api.bybit.com/v5/market/tickers?category=linear";
+    let url = "https://api.zoomex.com/v5/market/tickers?category=linear";
     let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("bybit futures: tickers fetch failed: {}", e);
+            tracing::warn!("zoomex futures: tickers fetch failed: {}", e);
             return Vec::new();
         }
     };
     let body: TickersResponse = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("bybit futures: tickers parse failed: {}", e);
+            tracing::warn!("zoomex futures: tickers parse failed: {}", e);
             return Vec::new();
         }
     };
@@ -122,7 +122,7 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
 
     loop {
         let mut url =
-            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
+            "https://api.zoomex.com/v5/market/instruments-info?category=linear&limit=1000"
                 .to_string();
         if let Some(ref c) = cursor {
             if !c.is_empty() {
@@ -133,7 +133,7 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
         let resp = match client.get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("bybit futures: instruments request failed: {}", e);
+                tracing::error!("zoomex futures: instruments request failed: {}", e);
                 break;
             }
         };
@@ -141,7 +141,7 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
         let body: InstrumentsResponse = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("bybit futures: instruments parse failed: {}", e);
+                tracing::error!("zoomex futures: instruments parse failed: {}", e);
                 break;
             }
         };
@@ -186,15 +186,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
     let mut attempt: u32 = 0;
 
     loop {
-        tracing::info!("bybit futures: fetching instrument list...");
+        tracing::info!("zoomex futures: fetching instrument list...");
         let instr = fetch_futures_instruments(&client).await;
         tracing::info!(
-            "bybit futures: found {} USDT perpetual symbols",
+            "zoomex futures: found {} USDT perpetual symbols",
             instr.symbols.len()
         );
 
         if instr.symbols.is_empty() {
-            tracing::warn!("bybit futures: no symbols found, retrying...");
+            tracing::warn!("zoomex futures: no symbols found, retrying...");
             backoff_sleep(attempt).await;
             attempt = attempt.saturating_add(1);
             continue;
@@ -204,8 +204,8 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         let mut current_symbols: HashSet<String> =
             instr.symbols.iter().cloned().collect();
 
-        tracing::info!("bybit futures: connecting...");
-        let url = "wss://stream.bybit.com/v5/public/linear";
+        tracing::info!("zoomex futures: connecting...");
+        let url = "wss://stream.zoomex.com/v5/public/linear";
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             connect_async(url),
@@ -213,7 +213,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         match ws_result {
             Ok(Ok((ws, _))) => {
                 attempt = 0;
-                tracing::info!("bybit futures: connected");
+                tracing::info!("zoomex futures: connected");
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 10
@@ -225,7 +225,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         "args": args
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("bybit futures: subscribe send error: {}", e);
+                        tracing::error!("zoomex futures: subscribe send error: {}", e);
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -235,7 +235,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let futures_tickers = fetch_futures_tickers(&client).await;
                 if !futures_tickers.is_empty() {
                     let ts = now_ms();
-                    let mut section = cache.bybit_future.write().await;
+                    let mut section = cache.zoomex_future.write().await;
                     for t in &futures_tickers {
                         if !current_symbols.contains(&t.symbol) {
                             continue;
@@ -260,7 +260,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         item.trade24_count = parse_f64(&t.turnover_24h);
                     }
                     tracing::info!(
-                        "bybit futures: seeded {} tickers from REST",
+                        "zoomex futures: seeded {} tickers from REST",
                         section.items.len()
                     );
                     section.serialize_cache();
@@ -282,11 +282,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::warn!("bybit futures: read error: {}", e);
+                                    tracing::warn!("zoomex futures: read error: {}", e);
                                     break;
                                 }
                                 None => {
-                                    tracing::warn!("bybit futures: stream ended");
+                                    tracing::warn!("zoomex futures: stream ended");
                                     break;
                                 }
                             };
@@ -295,7 +295,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Text(t) => t,
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
-                                    tracing::warn!("bybit futures: server closed connection");
+                                    tracing::warn!("zoomex futures: server closed connection");
                                     break;
                                 }
                                 _ => continue,
@@ -304,7 +304,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ws_msg: WsMsg = match serde_json::from_str(&text) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("bybit futures: parse error: {}", e);
+                                    tracing::warn!("zoomex futures: parse error: {}", e);
                                     continue;
                                 }
                             };
@@ -331,14 +331,14 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ticker: TickerData = match serde_json::from_value(data_val) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("bybit futures: parse ticker error: {}", e);
+                                    tracing::warn!("zoomex futures: parse ticker error: {}", e);
                                     continue;
                                 }
                             };
 
                             let ts = ws_msg.ts.unwrap_or_else(now_ms);
 
-                            let mut section = cache.bybit_future.write().await;
+                            let mut section = cache.zoomex_future.write().await;
                             section.ts = ts;
 
                             let item = section
@@ -390,28 +390,28 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             section.serialize_cache();
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("bybit futures: no message for 30s, reconnecting");
+                            tracing::warn!("zoomex futures: no message for 30s, reconnecting");
                             break;
                         }
                         _ = ping_interval.tick() => {
                             let ping = serde_json::json!({"op": "ping"});
                             if let Err(e) = write.send(Message::Text(ping.to_string().into())).await {
-                                tracing::error!("bybit futures: ping send error: {}", e);
+                                tracing::error!("zoomex futures: ping send error: {}", e);
                                 break;
                             }
                         }
                         _ = refresh_interval.tick() => {
-                            tracing::info!("bybit futures: refreshing instrument list...");
+                            tracing::info!("zoomex futures: refreshing instrument list...");
                             let new_instr = fetch_futures_instruments(&client).await;
                             if new_instr.symbols.is_empty() {
-                                tracing::warn!("bybit futures: refresh returned empty list, skipping");
+                                tracing::warn!("zoomex futures: refresh returned empty list, skipping");
                                 continue;
                             }
 
                             let new_symbols: HashSet<String> =
                                 new_instr.symbols.iter().cloned().collect();
                             tracing::info!(
-                                "bybit futures: refresh found {} symbols",
+                                "zoomex futures: refresh found {} symbols",
                                 new_symbols.len()
                             );
 
@@ -422,7 +422,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 .collect();
                             if !removed.is_empty() {
                                 tracing::info!(
-                                    "bybit futures: unsubscribing {} removed symbols",
+                                    "zoomex futures: unsubscribing {} removed symbols",
                                     removed.len()
                                 );
                                 for chunk in removed.chunks(10) {
@@ -433,7 +433,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         "args": args
                                     });
                                     if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
-                                        tracing::error!("bybit futures: unsub send error: {}", e);
+                                        tracing::error!("zoomex futures: unsub send error: {}", e);
                                         break;
                                     }
                                 }
@@ -446,7 +446,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 .collect();
                             if !added.is_empty() {
                                 tracing::info!(
-                                    "bybit futures: subscribing {} new symbols",
+                                    "zoomex futures: subscribing {} new symbols",
                                     added.len()
                                 );
                                 for chunk in added.chunks(10) {
@@ -457,7 +457,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         "args": args
                                     });
                                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                                        tracing::error!("bybit futures: sub send error: {}", e);
+                                        tracing::error!("zoomex futures: sub send error: {}", e);
                                         break;
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -466,13 +466,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
                             // Clean stale cache entries
                             {
-                                let mut section = cache.bybit_future.write().await;
+                                let mut section = cache.zoomex_future.write().await;
                                 let before = section.items.len();
                                 section.items.retain(|k, _| new_symbols.contains(k));
                                 let removed_count = before - section.items.len();
                                 if removed_count > 0 {
                                     tracing::info!(
-                                        "bybit futures: removed {} stale cache entries",
+                                        "zoomex futures: removed {} stale cache entries",
                                         removed_count
                                     );
                                 }
@@ -486,14 +486,14 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 }
             }
             Ok(Err(e)) => {
-                tracing::error!("bybit futures: connection failed: {}", e);
+                tracing::error!("zoomex futures: connection failed: {}", e);
             }
             Err(_) => {
-                tracing::error!("bybit futures: connection timed out");
+                tracing::error!("zoomex futures: connection timed out");
             }
         }
         // Clear cache on disconnect to prevent stale data
-        cache.bybit_future.write().await.clear();
+        cache.zoomex_future.write().await.clear();
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }

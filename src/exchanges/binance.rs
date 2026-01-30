@@ -60,7 +60,7 @@ async fn fetch_funding_info(
     client: &reqwest::Client,
 ) -> HashMap<String, (u32, String)> {
     let url = "https://fapi.binance.com/fapi/v1/fundingInfo";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("binance futures: funding info request failed: {}", e);
@@ -90,7 +90,7 @@ async fn fetch_funding_info(
 /// so without this, illiquid symbols would stay at a=0 / b=0.
 async fn fetch_book_tickers(client: &reqwest::Client) -> Vec<RestBookTicker> {
     let url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("binance futures: book ticker fetch failed: {}", e);
@@ -120,8 +120,12 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
         tracing::info!("binance futures: connecting...");
         let url = "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker";
-        match connect_async(url).await {
-            Ok((ws, _)) => {
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async(url),
+        ).await;
+        match ws_result {
+            Ok(Ok((ws, _))) => {
                 attempt = 0;
                 tracing::info!("binance futures: connected");
 
@@ -152,6 +156,8 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 }
 
                 let (mut write, mut read) = ws.split();
+
+                let connect_time = tokio::time::Instant::now();
 
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
@@ -315,6 +321,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             tracing::warn!("binance futures: no message for 30s, reconnecting");
                             break;
                         }
+                        _ = tokio::time::sleep_until(connect_time + std::time::Duration::from_secs(85500)) => {
+                            tracing::info!("binance futures: approaching 24h limit, proactively reconnecting");
+                            break;
+                        }
                         _ = refresh_interval.tick() => {
                             tracing::info!("binance futures: refreshing instrument list...");
                             let new_funding = fetch_funding_info(&client).await;
@@ -373,10 +383,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!("binance futures: connection failed: {}", e);
             }
+            Err(_) => {
+                tracing::error!("binance futures: connection timed out");
+            }
         }
+        // Clear cache on disconnect to prevent stale data
+        cache.binance_future.write().await.clear();
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }

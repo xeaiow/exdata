@@ -8,6 +8,7 @@ pub struct Cache {
     pub okx_future: RwLock<ExchangeSection>,
     pub gate_future: RwLock<ExchangeSection>,
     pub bitget_future: RwLock<ExchangeSection>,
+    pub zoomex_future: RwLock<ExchangeSection>,
 }
 
 impl Cache {
@@ -18,6 +19,7 @@ impl Cache {
             okx_future: RwLock::new(ExchangeSection::new()),
             gate_future: RwLock::new(ExchangeSection::new()),
             bitget_future: RwLock::new(ExchangeSection::new()),
+            zoomex_future: RwLock::new(ExchangeSection::new()),
         }
     }
 }

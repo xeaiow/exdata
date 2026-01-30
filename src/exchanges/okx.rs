@@ -32,6 +32,8 @@ struct WsMsg {
     data: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     event: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,7 +79,7 @@ struct OkxTickerItem {
 
 async fn fetch_swap_tickers(client: &reqwest::Client) -> Vec<OkxTickerItem> {
     let url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("okx futures: tickers fetch failed: {}", e);
@@ -97,7 +99,7 @@ async fn fetch_swap_tickers(client: &reqwest::Client) -> Vec<OkxTickerItem> {
 /// Fetch swap instrument instIds (USDT settle, linear, live state).
 async fn fetch_swap_instruments(client: &reqwest::Client) -> Vec<String> {
     let url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
-    let resp = match client.get(url).send().await {
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("okx futures: instruments request failed: {}", e);
@@ -149,8 +151,12 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
         tracing::info!("okx futures: connecting...");
         let url = "wss://ws.okx.com:8443/ws/v5/public";
-        match connect_async(url).await {
-            Ok((ws, _)) => {
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async(url),
+        ).await;
+        match ws_result {
+            Ok(Ok((ws, _))) => {
                 attempt = 0;
                 tracing::info!("okx futures: connected");
                 let (mut write, mut read) = ws.split();
@@ -263,8 +269,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 }
                             };
 
-                            // Skip subscribe confirmations
+                            // Handle event messages
                             if ws_msg.event.is_some() {
+                                if ws_msg.code.as_deref() == Some("64008") {
+                                    tracing::warn!("okx futures: maintenance warning (64008), reconnecting in 5s...");
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    break;
+                                }
                                 continue;
                             }
 
@@ -494,10 +505,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!("okx futures: connection failed: {}", e);
             }
+            Err(_) => {
+                tracing::error!("okx futures: connection timed out");
+            }
         }
+        // Clear cache on disconnect to prevent stale data
+        cache.okx_future.write().await.clear();
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }
