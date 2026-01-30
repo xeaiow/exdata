@@ -171,20 +171,17 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::interval(std::time::Duration::from_secs(25));
                 ping_interval.tick().await; // consume the immediate first tick
 
-                let mut connected = true;
-                while connected {
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
                                     tracing::error!("okx spot: read error: {}", e);
-                                    connected = false;
                                     break;
                                 }
                                 None => {
                                     tracing::warn!("okx spot: stream ended");
-                                    connected = false;
                                     break;
                                 }
                             };
@@ -194,7 +191,6 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
                                     tracing::warn!("okx spot: server closed connection");
-                                    connected = false;
                                     break;
                                 }
                                 _ => continue,
@@ -274,7 +270,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             // OKX uses plain text "ping" for heartbeat
                             if let Err(e) = write.send(Message::Text("ping".into())).await {
                                 tracing::error!("okx spot: ping send error: {}", e);
-                                connected = false;
+                                break;
                             }
                         }
                     }
@@ -347,20 +343,17 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::interval(std::time::Duration::from_secs(25));
                 ping_interval.tick().await; // consume the immediate first tick
 
-                let mut connected = true;
-                while connected {
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
                                     tracing::error!("okx futures: read error: {}", e);
-                                    connected = false;
                                     break;
                                 }
                                 None => {
                                     tracing::warn!("okx futures: stream ended");
-                                    connected = false;
                                     break;
                                 }
                             };
@@ -370,7 +363,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
                                     tracing::warn!("okx futures: server closed connection");
-                                    connected = false;
                                     break;
                                 }
                                 _ => continue,
@@ -503,7 +495,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             // OKX uses plain text "ping" for heartbeat
                             if let Err(e) = write.send(Message::Text("ping".into())).await {
                                 tracing::error!("okx futures: ping send error: {}", e);
-                                connected = false;
+                                break;
                             }
                         }
                     }

@@ -48,7 +48,7 @@ struct WsMsg {
 #[derive(Deserialize)]
 struct WsArg {
     #[serde(rename = "instType")]
-    inst_type: String,
+    _inst_type: String,
     channel: String,
     #[serde(rename = "instId")]
     inst_id: String,
@@ -193,20 +193,17 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::interval(std::time::Duration::from_secs(30));
                 ping_interval.tick().await; // consume the immediate first tick
 
-                let mut connected = true;
-                while connected {
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
                                     tracing::error!("bitget spot: read error: {}", e);
-                                    connected = false;
                                     break;
                                 }
                                 None => {
                                     tracing::warn!("bitget spot: stream ended");
-                                    connected = false;
                                     break;
                                 }
                             };
@@ -216,7 +213,6 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
                                     tracing::warn!("bitget spot: server closed connection");
-                                    connected = false;
                                     break;
                                 }
                                 _ => continue,
@@ -296,7 +292,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             // Bitget uses plain text "ping" for heartbeat
                             if let Err(e) = write.send(Message::Text("ping".into())).await {
                                 tracing::error!("bitget spot: ping send error: {}", e);
-                                connected = false;
+                                break;
                             }
                         }
                     }
@@ -370,20 +366,17 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     tokio::time::interval(std::time::Duration::from_secs(30));
                 ping_interval.tick().await; // consume the immediate first tick
 
-                let mut connected = true;
-                while connected {
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
                                     tracing::error!("bitget futures: read error: {}", e);
-                                    connected = false;
                                     break;
                                 }
                                 None => {
                                     tracing::warn!("bitget futures: stream ended");
-                                    connected = false;
                                     break;
                                 }
                             };
@@ -393,7 +386,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
                                     tracing::warn!("bitget futures: server closed connection");
-                                    connected = false;
                                     break;
                                 }
                                 _ => continue,
@@ -505,7 +497,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             // Bitget uses plain text "ping" for heartbeat
                             if let Err(e) = write.send(Message::Text("ping".into())).await {
                                 tracing::error!("bitget futures: ping send error: {}", e);
-                                connected = false;
+                                break;
                             }
                         }
                     }

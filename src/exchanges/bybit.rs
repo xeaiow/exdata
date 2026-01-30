@@ -227,20 +227,17 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                 let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
                 ping_interval.tick().await; // consume the immediate first tick
 
-                let mut connected = true;
-                while connected {
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
                                     tracing::error!("bybit spot: read error: {}", e);
-                                    connected = false;
                                     break;
                                 }
                                 None => {
                                     tracing::warn!("bybit spot: stream ended");
-                                    connected = false;
                                     break;
                                 }
                             };
@@ -250,7 +247,6 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
                                     tracing::warn!("bybit spot: server closed connection");
-                                    connected = false;
                                     break;
                                 }
                                 _ => continue,
@@ -321,7 +317,7 @@ pub async fn run_spot(cache: SharedCache, client: reqwest::Client) {
                             let ping = serde_json::json!({"op": "ping"});
                             if let Err(e) = write.send(Message::Text(ping.to_string().into())).await {
                                 tracing::error!("bybit spot: ping send error: {}", e);
-                                connected = false;
+                                break;
                             }
                         }
                     }
@@ -384,20 +380,17 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
                 ping_interval.tick().await; // consume the immediate first tick
 
-                let mut connected = true;
-                while connected {
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
                                     tracing::error!("bybit futures: read error: {}", e);
-                                    connected = false;
                                     break;
                                 }
                                 None => {
                                     tracing::warn!("bybit futures: stream ended");
-                                    connected = false;
                                     break;
                                 }
                             };
@@ -407,7 +400,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
                                     tracing::warn!("bybit futures: server closed connection");
-                                    connected = false;
                                     break;
                                 }
                                 _ => continue,
@@ -502,7 +494,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ping = serde_json::json!({"op": "ping"});
                             if let Err(e) = write.send(Message::Text(ping.to_string().into())).await {
                                 tracing::error!("bybit futures: ping send error: {}", e);
-                                connected = false;
+                                break;
                             }
                         }
                     }
