@@ -3,7 +3,7 @@ use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
 use crate::models::ExchangeItem;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ── REST serde structs ──────────────────────────────────────────────────────
@@ -327,7 +327,9 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             continue;
         }
 
-        let funding_info = instr.funding_info;
+        let mut funding_info = instr.funding_info;
+        let mut current_symbols: HashSet<String> =
+            instr.symbols.iter().cloned().collect();
 
         tracing::info!("bitget futures: connecting...");
         let url = "wss://ws.bitget.com/v2/ws/public";
@@ -365,6 +367,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
                 ping_interval.tick().await; // consume the immediate first tick
+
+                let mut refresh_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(300));
+                refresh_interval.tick().await; // consume the immediate first tick
 
                 loop {
                     tokio::select! {
@@ -499,6 +505,103 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 tracing::error!("bitget futures: ping send error: {}", e);
                                 break;
                             }
+                        }
+                        _ = refresh_interval.tick() => {
+                            tracing::info!("bitget futures: refreshing contracts list...");
+                            let new_instr = fetch_futures_contracts(&client).await;
+                            if new_instr.symbols.is_empty() {
+                                tracing::warn!("bitget futures: refresh returned empty list, skipping");
+                                continue;
+                            }
+
+                            let new_symbols: HashSet<String> =
+                                new_instr.symbols.iter().cloned().collect();
+                            tracing::info!(
+                                "bitget futures: refresh found {} contracts",
+                                new_symbols.len()
+                            );
+
+                            // Unsubscribe removed symbols
+                            let removed: Vec<String> = current_symbols
+                                .difference(&new_symbols)
+                                .cloned()
+                                .collect();
+                            if !removed.is_empty() {
+                                tracing::info!(
+                                    "bitget futures: unsubscribing {} removed symbols",
+                                    removed.len()
+                                );
+                                let unsub_args: Vec<serde_json::Value> = removed
+                                    .iter()
+                                    .map(|s| {
+                                        serde_json::json!({
+                                            "instType": "USDT-FUTURES",
+                                            "channel": "ticker",
+                                            "instId": s
+                                        })
+                                    })
+                                    .collect();
+                                for chunk in unsub_args.chunks(50) {
+                                    let unsub = serde_json::json!({
+                                        "op": "unsubscribe",
+                                        "args": chunk
+                                    });
+                                    if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
+                                        tracing::error!("bitget futures: unsub send error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Subscribe new symbols
+                            let added: Vec<String> = new_symbols
+                                .difference(&current_symbols)
+                                .cloned()
+                                .collect();
+                            if !added.is_empty() {
+                                tracing::info!(
+                                    "bitget futures: subscribing {} new symbols",
+                                    added.len()
+                                );
+                                let sub_args: Vec<serde_json::Value> = added
+                                    .iter()
+                                    .map(|s| {
+                                        serde_json::json!({
+                                            "instType": "USDT-FUTURES",
+                                            "channel": "ticker",
+                                            "instId": s
+                                        })
+                                    })
+                                    .collect();
+                                for chunk in sub_args.chunks(50) {
+                                    let sub = serde_json::json!({
+                                        "op": "subscribe",
+                                        "args": chunk
+                                    });
+                                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                                        tracing::error!("bitget futures: sub send error: {}", e);
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+
+                            // Clean stale cache entries (Bitget symbols are already normalized)
+                            {
+                                let mut section = cache.bitget_future.write().await;
+                                let before = section.items.len();
+                                section.items.retain(|k, _| new_symbols.contains(k));
+                                let removed_count = before - section.items.len();
+                                if removed_count > 0 {
+                                    tracing::info!(
+                                        "bitget futures: removed {} stale cache entries",
+                                        removed_count
+                                    );
+                                }
+                            }
+
+                            current_symbols = new_symbols;
+                            funding_info = new_instr.funding_info;
                         }
                     }
                 }

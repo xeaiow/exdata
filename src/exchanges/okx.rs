@@ -3,6 +3,7 @@ use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
 use crate::models::ExchangeItem;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::collections::HashSet;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ── REST serde structs ──────────────────────────────────────────────────────
@@ -305,6 +306,9 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             continue;
         }
 
+        let mut current_instruments: HashSet<String> =
+            instruments.iter().cloned().collect();
+
         tracing::info!("okx futures: connecting...");
         let url = "wss://ws.okx.com:8443/ws/v5/public";
         match connect_async(url).await {
@@ -342,6 +346,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(25));
                 ping_interval.tick().await; // consume the immediate first tick
+
+                let mut refresh_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(300));
+                refresh_interval.tick().await; // consume the immediate first tick
 
                 loop {
                     tokio::select! {
@@ -497,6 +505,110 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 tracing::error!("okx futures: ping send error: {}", e);
                                 break;
                             }
+                        }
+                        _ = refresh_interval.tick() => {
+                            tracing::info!("okx futures: refreshing instrument list...");
+                            let new_instruments_vec = fetch_swap_instruments(&client).await;
+                            if new_instruments_vec.is_empty() {
+                                tracing::warn!("okx futures: refresh returned empty list, skipping");
+                                continue;
+                            }
+
+                            let new_instruments: HashSet<String> =
+                                new_instruments_vec.iter().cloned().collect();
+                            tracing::info!(
+                                "okx futures: refresh found {} instruments",
+                                new_instruments.len()
+                            );
+
+                            // Unsubscribe removed instruments (both tickers + funding-rate)
+                            let removed: Vec<String> = current_instruments
+                                .difference(&new_instruments)
+                                .cloned()
+                                .collect();
+                            if !removed.is_empty() {
+                                tracing::info!(
+                                    "okx futures: unsubscribing {} removed instruments",
+                                    removed.len()
+                                );
+                                let mut unsub_args: Vec<serde_json::Value> = Vec::new();
+                                for inst_id in &removed {
+                                    unsub_args.push(serde_json::json!({
+                                        "channel": "tickers",
+                                        "instId": inst_id
+                                    }));
+                                    unsub_args.push(serde_json::json!({
+                                        "channel": "funding-rate",
+                                        "instId": inst_id
+                                    }));
+                                }
+                                for chunk in unsub_args.chunks(50) {
+                                    let unsub = serde_json::json!({
+                                        "op": "unsubscribe",
+                                        "args": chunk
+                                    });
+                                    if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
+                                        tracing::error!("okx futures: unsub send error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Subscribe new instruments (both tickers + funding-rate)
+                            let added: Vec<String> = new_instruments
+                                .difference(&current_instruments)
+                                .cloned()
+                                .collect();
+                            if !added.is_empty() {
+                                tracing::info!(
+                                    "okx futures: subscribing {} new instruments",
+                                    added.len()
+                                );
+                                let mut sub_args: Vec<serde_json::Value> = Vec::new();
+                                for inst_id in &added {
+                                    sub_args.push(serde_json::json!({
+                                        "channel": "tickers",
+                                        "instId": inst_id
+                                    }));
+                                    sub_args.push(serde_json::json!({
+                                        "channel": "funding-rate",
+                                        "instId": inst_id
+                                    }));
+                                }
+                                for chunk in sub_args.chunks(50) {
+                                    let sub = serde_json::json!({
+                                        "op": "subscribe",
+                                        "args": chunk
+                                    });
+                                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                                        tracing::error!("okx futures: sub send error: {}", e);
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+
+                            // Clean stale cache entries
+                            // Cache keys are normalized (e.g. "BTCUSDT") but instrument IDs
+                            // are OKX format (e.g. "BTC-USDT-SWAP"), so build valid normalized set
+                            {
+                                let valid_normalized: HashSet<String> = new_instruments
+                                    .iter()
+                                    .map(|id| normalize_swap(id))
+                                    .collect();
+                                let mut section = cache.okx_future.write().await;
+                                let before = section.items.len();
+                                section.items.retain(|k, _| valid_normalized.contains(k));
+                                let removed_count = before - section.items.len();
+                                if removed_count > 0 {
+                                    tracing::info!(
+                                        "okx futures: removed {} stale cache entries",
+                                        removed_count
+                                    );
+                                }
+                            }
+
+                            current_instruments = new_instruments;
                         }
                     }
                 }

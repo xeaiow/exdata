@@ -3,7 +3,7 @@ use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
 use crate::models::ExchangeItem;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ── REST serde structs ──────────────────────────────────────────────────────
@@ -352,7 +352,9 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             continue;
         }
 
-        let funding_info = instr.funding_info;
+        let mut funding_info = instr.funding_info;
+        let mut current_symbols: HashSet<String> =
+            instr.symbols.iter().cloned().collect();
 
         tracing::info!("bybit futures: connecting...");
         let url = "wss://stream.bybit.com/v5/public/linear";
@@ -379,6 +381,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
                 let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
                 ping_interval.tick().await; // consume the immediate first tick
+
+                let mut refresh_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(300));
+                refresh_interval.tick().await; // consume the immediate first tick
 
                 loop {
                     tokio::select! {
@@ -496,6 +502,87 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 tracing::error!("bybit futures: ping send error: {}", e);
                                 break;
                             }
+                        }
+                        _ = refresh_interval.tick() => {
+                            tracing::info!("bybit futures: refreshing instrument list...");
+                            let new_instr = fetch_futures_instruments(&client).await;
+                            if new_instr.symbols.is_empty() {
+                                tracing::warn!("bybit futures: refresh returned empty list, skipping");
+                                continue;
+                            }
+
+                            let new_symbols: HashSet<String> =
+                                new_instr.symbols.iter().cloned().collect();
+                            tracing::info!(
+                                "bybit futures: refresh found {} symbols",
+                                new_symbols.len()
+                            );
+
+                            // Unsubscribe removed symbols
+                            let removed: Vec<String> = current_symbols
+                                .difference(&new_symbols)
+                                .cloned()
+                                .collect();
+                            if !removed.is_empty() {
+                                tracing::info!(
+                                    "bybit futures: unsubscribing {} removed symbols",
+                                    removed.len()
+                                );
+                                for chunk in removed.chunks(10) {
+                                    let args: Vec<String> =
+                                        chunk.iter().map(|s| format!("tickers.{}", s)).collect();
+                                    let unsub = serde_json::json!({
+                                        "op": "unsubscribe",
+                                        "args": args
+                                    });
+                                    if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
+                                        tracing::error!("bybit futures: unsub send error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Subscribe new symbols
+                            let added: Vec<String> = new_symbols
+                                .difference(&current_symbols)
+                                .cloned()
+                                .collect();
+                            if !added.is_empty() {
+                                tracing::info!(
+                                    "bybit futures: subscribing {} new symbols",
+                                    added.len()
+                                );
+                                for chunk in added.chunks(10) {
+                                    let args: Vec<String> =
+                                        chunk.iter().map(|s| format!("tickers.{}", s)).collect();
+                                    let sub = serde_json::json!({
+                                        "op": "subscribe",
+                                        "args": args
+                                    });
+                                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                                        tracing::error!("bybit futures: sub send error: {}", e);
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+
+                            // Clean stale cache entries
+                            {
+                                let mut section = cache.bybit_future.write().await;
+                                let before = section.items.len();
+                                section.items.retain(|k, _| new_symbols.contains(k));
+                                let removed_count = before - section.items.len();
+                                if removed_count > 0 {
+                                    tracing::info!(
+                                        "bybit futures: removed {} stale cache entries",
+                                        removed_count
+                                    );
+                                }
+                            }
+
+                            current_symbols = new_symbols;
+                            funding_info = new_instr.funding_info;
                         }
                     }
                 }
