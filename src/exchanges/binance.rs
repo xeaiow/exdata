@@ -52,6 +52,15 @@ struct FundingInfoItem {
     funding_interval_hours: u32,
 }
 
+#[derive(Deserialize)]
+struct RestBookTicker {
+    symbol: String,
+    #[serde(rename = "bidPrice")]
+    bid_price: String,
+    #[serde(rename = "askPrice")]
+    ask_price: String,
+}
+
 // ── Spot ────────────────────────────────────────────────────────────────────
 
 pub async fn run_spot(cache: SharedCache) {
@@ -150,6 +159,27 @@ async fn fetch_funding_info(
     map
 }
 
+/// Fetch initial book ticker snapshot so every symbol has bid/ask from the start.
+/// The `!bookTicker` WebSocket stream is push-on-change only (no initial snapshot),
+/// so without this, illiquid symbols would stay at a=0 / b=0.
+async fn fetch_book_tickers(client: &reqwest::Client) -> Vec<RestBookTicker> {
+    let url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("binance futures: book ticker fetch failed: {}", e);
+            return Vec::new();
+        }
+    };
+    match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("binance futures: book ticker parse failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 // ── Futures ─────────────────────────────────────────────────────────────────
 
 pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
@@ -168,6 +198,31 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             Ok((ws, _)) => {
                 attempt = 0;
                 tracing::info!("binance futures: connected");
+
+                // Seed bid/ask from REST before entering the WS loop
+                let book_tickers = fetch_book_tickers(&client).await;
+                if !book_tickers.is_empty() {
+                    let mut section = cache.binance_future.write().await;
+                    for bt in &book_tickers {
+                        if !bt.symbol.ends_with("USDT") {
+                            continue;
+                        }
+                        let item =
+                            section.items.entry(bt.symbol.clone()).or_insert_with(|| {
+                                ExchangeItem {
+                                    name: bt.symbol.clone(),
+                                    ..Default::default()
+                                }
+                            });
+                        item.a = parse_f64(&bt.ask_price);
+                        item.b = parse_f64(&bt.bid_price);
+                    }
+                    tracing::info!(
+                        "binance futures: seeded {} book tickers from REST",
+                        section.items.len()
+                    );
+                }
+
                 let (_, mut read) = ws.split();
 
                 while let Some(msg) = read.next().await {
