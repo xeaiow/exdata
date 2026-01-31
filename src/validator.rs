@@ -67,6 +67,7 @@ const EXCHANGES: &[ExchangeMapping] = &[
     ExchangeMapping { display_name: "Bitget", baseline_key: "bitgetFuture" },
     ExchangeMapping { display_name: "Gate", baseline_key: "gateFuture" },
     ExchangeMapping { display_name: "Zoomex", baseline_key: "bybitFuture" },
+    ExchangeMapping { display_name: "Bybit", baseline_key: "bybitFuture" },
 ];
 
 // ── Main loop ───────────────────────────────────────────────────────────────
@@ -299,12 +300,13 @@ fn parse_f64(s: &str) -> f64 {
 // ── Read own cache ──────────────────────────────────────────────────────────
 
 async fn read_own_cache(cache: &SharedCache) -> Vec<HashMap<String, ExchangeItem>> {
-    let (binance, okx, bitget, gate, zoomex) = tokio::join!(
+    let (binance, okx, bitget, gate, zoomex, bybit) = tokio::join!(
         cache.binance_future.read(),
         cache.okx_future.read(),
         cache.bitget_future.read(),
         cache.gate_future.read(),
         cache.zoomex_future.read(),
+        cache.bybit_future.read(),
     );
     vec![
         binance.items.clone(),
@@ -312,6 +314,7 @@ async fn read_own_cache(cache: &SharedCache) -> Vec<HashMap<String, ExchangeItem
         bitget.items.clone(),
         gate.items.clone(),
         zoomex.items.clone(),
+        bybit.items.clone(),
     ]
 }
 
