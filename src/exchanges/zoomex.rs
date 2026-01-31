@@ -90,7 +90,7 @@ struct RestTickerItem {
 }
 
 async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<RestTickerItem> {
-    let url = "https://api.zoomex.com/v5/market/tickers?category=linear";
+    let url = "https://openapi.zoomex.com/cloud/trade/v3/market/tickers?category=linear";
     let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -122,7 +122,7 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
 
     loop {
         let mut url =
-            "https://api.zoomex.com/v5/market/instruments-info?category=linear&limit=1000"
+            "https://openapi.zoomex.com/cloud/trade/v3/market/instruments-info?category=linear&limit=1000"
                 .to_string();
         if let Some(ref c) = cursor {
             if !c.is_empty() {
