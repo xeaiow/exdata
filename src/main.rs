@@ -60,6 +60,16 @@ async fn main() {
         });
     }
 
+    // Spread calculator: receives TickerChanged events, computes spreads,
+    // broadcasts SpreadOpportunity to WS clients.
+    let (spread_tx, _) = tokio::sync::broadcast::channel::<spread::SpreadOpportunity>(4096);
+    {
+        let cache = cache.clone();
+        let ticker_rx = cache.ticker_tx.subscribe();
+        let spread_tx = spread_tx.clone();
+        tokio::spawn(spread::run_spread_calculator(cache, ticker_rx, spread_tx));
+    }
+
     let app = Router::new()
         .route("/api/exdata", get(api::get_exdata))
         .layer(CompressionLayer::new())

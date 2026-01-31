@@ -45,13 +45,13 @@ pub struct TickerChanged {
     pub symbol: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Volume24h {
     pub long: f64,
     pub short: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SpreadOpportunity {
     pub symbol: String,
     pub long_exchange: &'static str,
@@ -207,4 +207,67 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
     let mut result: Vec<String> = symbols.into_iter().collect();
     result.sort();
     result
+}
+
+// ── Spread calculator task ─────────────────────────────────────────────────
+
+/// Spread calculator task: listens for TickerChanged events, computes spreads,
+/// and broadcasts SpreadOpportunity updates to all WS clients.
+///
+/// Tiered throttle: spread > 3% → immediate, spread ≤ 3% → max once per 500ms per pair.
+pub async fn run_spread_calculator(
+    cache: SharedCache,
+    mut ticker_rx: tokio::sync::broadcast::Receiver<TickerChanged>,
+    spread_tx: tokio::sync::broadcast::Sender<SpreadOpportunity>,
+) {
+    // Throttle state: (symbol, long_exchange, short_exchange) → last_sent_ms
+    let mut last_sent: std::collections::HashMap<(String, &'static str, &'static str), u64> =
+        std::collections::HashMap::new();
+
+    loop {
+        let event = match ticker_rx.recv().await {
+            Ok(e) => e,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("spread calculator: lagged {} events, continuing", n);
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::error!("spread calculator: ticker channel closed");
+                break;
+            }
+        };
+
+        // Read tickers for the changed symbol across all exchanges
+        let tickers = read_symbol_tickers(&cache, &event.symbol).await;
+        if tickers.len() < 2 {
+            continue; // Need at least 2 exchanges
+        }
+
+        // Compute all spread pairs for this symbol
+        let opportunities = compute_spreads(&event.symbol, &tickers);
+        let now = now_ms();
+
+        for opp in opportunities {
+            let key = (
+                opp.symbol.clone(),
+                opp.long_exchange,
+                opp.short_exchange,
+            );
+
+            // Tiered throttle
+            let should_send = if opp.spread_percent > 3.0 {
+                true // High-value: always send immediately
+            } else {
+                match last_sent.get(&key) {
+                    Some(&last_ts) => now.saturating_sub(last_ts) >= 500,
+                    None => true,
+                }
+            };
+
+            if should_send {
+                last_sent.insert(key, now);
+                let _ = spread_tx.send(opp);
+            }
+        }
+    }
 }
