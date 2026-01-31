@@ -410,7 +410,8 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             tracing::info!("bybit futures: refreshing instrument list...");
                             let new_instr = fetch_futures_instruments(&client).await;
                             if new_instr.symbols.is_empty() {
-                                tracing::warn!("bybit futures: refresh returned empty list, skipping");
+                                tracing::warn!("bybit futures: refresh returned empty list, retrying in 30s");
+                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                                 continue;
                             }
 

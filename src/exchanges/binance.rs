@@ -162,6 +162,9 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let mut refresh_interval =
                     tokio::time::interval(std::time::Duration::from_secs(300));
                 refresh_interval.tick().await; // consume the immediate first tick
+                if funding_info.is_empty() {
+                    refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+                }
 
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
@@ -329,7 +332,8 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             tracing::info!("binance futures: refreshing instrument list...");
                             let new_funding = fetch_funding_info(&client).await;
                             if new_funding.is_empty() {
-                                tracing::warn!("binance futures: refresh returned empty funding info, skipping");
+                                tracing::warn!("binance futures: refresh returned empty funding info, retrying in 30s");
+                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                                 continue;
                             }
                             let new_book = fetch_book_tickers(&client).await;

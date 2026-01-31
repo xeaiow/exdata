@@ -493,7 +493,8 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             tracing::info!("gate futures: refreshing contracts list...");
                             let new_contract_info = fetch_futures_contracts(&client).await;
                             if new_contract_info.symbols.is_empty() {
-                                tracing::warn!("gate futures: refresh returned empty list, skipping");
+                                tracing::warn!("gate futures: refresh returned empty list, retrying in 30s");
+                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                                 continue;
                             }
 

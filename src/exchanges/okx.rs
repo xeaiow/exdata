@@ -407,7 +407,8 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             tracing::info!("okx futures: refreshing instrument list...");
                             let new_instruments_vec = fetch_swap_instruments(&client).await;
                             if new_instruments_vec.is_empty() {
-                                tracing::warn!("okx futures: refresh returned empty list, skipping");
+                                tracing::warn!("okx futures: refresh returned empty list, retrying in 30s");
+                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                                 continue;
                             }
 
