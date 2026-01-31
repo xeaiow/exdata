@@ -367,6 +367,7 @@ async fn run_chunk(
                                         .and_then(|v| v.as_str())
                                         .unwrap_or(&arg.inst_id);
                                     let normalized = normalize_swap(inst_id);
+                                    let symbol_for_event = normalized.clone();
 
                                     let ask_px = data
                                         .get("askPx")
@@ -397,6 +398,11 @@ async fn run_chunk(
                                     item.ts = ts;
                                     item.trade24_count = parse_f64(vol_ccy);
                                     section.dirty = true;
+                                    drop(section);
+                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                        exchange: crate::spread::ExchangeName::Okx,
+                                        symbol: symbol_for_event,
+                                    });
                                 }
                                 "funding-rate" => {
                                     let inst_id = data

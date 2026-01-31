@@ -438,6 +438,11 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
+                            drop(section);
+                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                exchange: crate::spread::ExchangeName::Bybit,
+                                symbol: ticker.symbol.clone(),
+                            });
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
                             tracing::warn!("bybit futures chunk-{}: no message for 30s, reconnecting", chunk_id);

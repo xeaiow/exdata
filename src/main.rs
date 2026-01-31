@@ -15,7 +15,8 @@ use tower_http::compression::CompressionLayer;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let cache: SharedCache = Arc::new(Cache::new());
+    let (ticker_tx, _) = tokio::sync::broadcast::channel::<spread::TickerChanged>(4096);
+    let cache: SharedCache = Arc::new(Cache::new(ticker_tx));
     let client = reqwest::Client::new();
 
     // Spawn exchange tasks (5 futures only)

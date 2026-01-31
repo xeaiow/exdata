@@ -454,6 +454,7 @@ async fn run_chunk(
                                     }
 
                                     let normalized = normalize_symbol(contract);
+                                    let symbol_for_event = normalized.clone();
 
                                     let ask = result
                                         .get("a")
@@ -497,6 +498,11 @@ async fn run_chunk(
                                         }
                                     }
                                     section.dirty = true;
+                                    drop(section);
+                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                        exchange: crate::spread::ExchangeName::Gate,
+                                        symbol: symbol_for_event,
+                                    });
                                 }
                                 _ => {}
                             }

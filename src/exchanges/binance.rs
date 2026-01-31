@@ -299,6 +299,11 @@ async fn run_chunk(
                                     item.rate_max = Some(max_rate.clone());
                                 }
                                 section.dirty = true;
+                                drop(section);
+                                let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                    exchange: crate::spread::ExchangeName::Binance,
+                                    symbol: bt.s.clone(),
+                                });
                             } else if stream == "!ticker@arr" {
                                 let tickers: Vec<FuturesTicker> =
                                     match serde_json::from_value(combined.data) {
