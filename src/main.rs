@@ -5,6 +5,7 @@ mod exchanges;
 mod models;
 mod validator;
 mod spread;
+mod ws;
 
 use axum::{Router, routing::get};
 use cache::{Cache, SharedCache};
@@ -70,10 +71,22 @@ async fn main() {
         tokio::spawn(spread::run_spread_calculator(cache, ticker_rx, spread_tx));
     }
 
-    let app = Router::new()
+    // REST routes (state: SharedCache)
+    let rest_app = Router::new()
         .route("/api/exdata", get(api::get_exdata))
         .layer(CompressionLayer::new())
-        .with_state(cache);
+        .with_state(cache.clone());
+
+    // WS routes (state: SharedWsState)
+    let ws_state: ws::SharedWsState = Arc::new(ws::WsState {
+        cache: cache.clone(),
+        spread_tx: spread_tx.clone(),
+    });
+    let ws_app = Router::new()
+        .route("/ws/spreads", get(ws::ws_spreads))
+        .with_state(ws_state);
+
+    let app = rest_app.merge(ws_app);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on 0.0.0.0:3000");
