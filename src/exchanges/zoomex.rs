@@ -233,8 +233,9 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
     }
 }
 
-// ── Futures ──────────────────────────────────────────────────────────────────
+// ── Futures (coordinator + chunk workers) ───────────────────────────────────
 
+/// Coordinator: fetches instruments, seeds REST, spawns chunk workers, restarts every 5 min.
 pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
     let mut attempt: u32 = 0;
 
@@ -252,12 +253,95 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             attempt = attempt.saturating_add(1);
             continue;
         }
+        attempt = 0;
 
-        let mut funding_info = instr.funding_info;
-        let mut current_symbols: HashSet<String> =
-            instr.symbols.iter().cloned().collect();
+        let current_symbols: HashSet<String> = instr.symbols.iter().cloned().collect();
 
-        tracing::info!("zoomex futures: connecting...");
+        // Seed bid/ask from REST
+        let futures_tickers = fetch_futures_tickers(&client).await;
+        if !futures_tickers.is_empty() {
+            let ts = now_ms();
+            let mut section = cache.zoomex_future.write().await;
+            for t in &futures_tickers {
+                if !current_symbols.contains(&t.symbol) {
+                    continue;
+                }
+                let item = section
+                    .items
+                    .entry(t.symbol.clone())
+                    .or_insert_with(|| {
+                        let mut ei = ExchangeItem {
+                            name: t.symbol.clone(),
+                            ..Default::default()
+                        };
+                        if let Some((interval, max_rate)) = instr.funding_info.get(&t.symbol) {
+                            ei.rate_interval = Some(*interval);
+                            ei.rate_max = Some(max_rate.clone());
+                        }
+                        ei
+                    });
+                item.a = parse_f64(&t.ask1_price);
+                item.b = parse_f64(&t.bid1_price);
+                item.ts = ts;
+                item.trade24_count = parse_f64(&t.turnover_24h);
+            }
+            tracing::info!(
+                "zoomex futures: seeded {} tickers from REST",
+                section.items.len()
+            );
+            section.serialize_cache();
+        }
+
+        // Split symbols into chunks of 50 and spawn a worker for each
+        let funding_info = std::sync::Arc::new(instr.funding_info);
+        let chunks: Vec<Vec<String>> = instr
+            .symbols
+            .chunks(50)
+            .map(|c| c.to_vec())
+            .collect();
+        let num_chunks = chunks.len();
+        tracing::info!(
+            "zoomex futures: spawning {} chunk workers ({} symbols)",
+            num_chunks,
+            instr.symbols.len()
+        );
+
+        let mut handles = Vec::with_capacity(num_chunks);
+        for (idx, chunk_symbols) in chunks.into_iter().enumerate() {
+            let cache = cache.clone();
+            let funding = funding_info.clone();
+            let handle = tokio::spawn(run_chunk(cache, chunk_symbols, funding, idx));
+            handles.push(handle);
+        }
+
+        // Sleep 5 minutes, then abort all chunks and restart
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+
+        tracing::info!("zoomex futures: coordinator restarting, aborting {} chunks", handles.len());
+        for h in &handles {
+            h.abort();
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Clear cache before full restart
+        cache.zoomex_future.write().await.clear();
+    }
+}
+
+/// Chunk worker: manages a single WS connection subscribing to ≤50 symbols.
+/// Self-reconnects on disconnect; no refresh logic (coordinator handles that).
+async fn run_chunk(
+    cache: SharedCache,
+    symbols: Vec<String>,
+    funding_info: std::sync::Arc<HashMap<String, (u32, String)>>,
+    chunk_id: usize,
+) {
+    let mut attempt: u32 = 0;
+
+    loop {
+        tracing::info!("zoomex futures chunk-{}: connecting ({} symbols)...", chunk_id, symbols.len());
         let url = "wss://stream.zoomex.com/v5/public/linear";
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -266,12 +350,12 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         match ws_result {
             Ok(Ok((ws, _))) => {
                 attempt = 0;
-                tracing::info!("zoomex futures: connected");
+                tracing::info!("zoomex futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 10
                 let mut subscribe_failed = false;
-                for chunk in instr.symbols.chunks(10) {
+                for chunk in symbols.chunks(10) {
                     let args: Vec<String> =
                         chunk.iter().map(|s| format!("tickers.{}", s)).collect();
                     let sub = serde_json::json!({
@@ -279,7 +363,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         "args": args
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("zoomex futures: subscribe send error: {}", e);
+                        tracing::error!("zoomex futures chunk-{}: subscribe send error: {}", chunk_id, e);
                         subscribe_failed = true;
                         break;
                     }
@@ -287,52 +371,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 }
 
                 if subscribe_failed {
-                    tracing::warn!("zoomex futures: subscribe failed, reconnecting...");
+                    tracing::warn!("zoomex futures chunk-{}: subscribe failed, reconnecting...", chunk_id);
                 } else {
-
-                // Seed bid/ask from REST
-                let futures_tickers = fetch_futures_tickers(&client).await;
-                if !futures_tickers.is_empty() {
-                    let ts = now_ms();
-                    let mut section = cache.zoomex_future.write().await;
-                    for t in &futures_tickers {
-                        if !current_symbols.contains(&t.symbol) {
-                            continue;
-                        }
-                        let item = section
-                            .items
-                            .entry(t.symbol.clone())
-                            .or_insert_with(|| {
-                                let mut ei = ExchangeItem {
-                                    name: t.symbol.clone(),
-                                    ..Default::default()
-                                };
-                                if let Some((interval, max_rate)) = funding_info.get(&t.symbol) {
-                                    ei.rate_interval = Some(*interval);
-                                    ei.rate_max = Some(max_rate.clone());
-                                }
-                                ei
-                            });
-                        item.a = parse_f64(&t.ask1_price);
-                        item.b = parse_f64(&t.bid1_price);
-                        item.ts = ts;
-                        item.trade24_count = parse_f64(&t.turnover_24h);
-                    }
-                    tracing::info!(
-                        "zoomex futures: seeded {} tickers from REST",
-                        section.items.len()
-                    );
-                    section.serialize_cache();
-                }
 
                 let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
                 ping_interval.tick().await; // consume the immediate first tick
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-
-                let mut refresh_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(300));
-                refresh_interval.tick().await; // consume the immediate first tick
 
                 loop {
                     tokio::select! {
@@ -341,11 +386,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::warn!("zoomex futures: read error: {}", e);
+                                    tracing::warn!("zoomex futures chunk-{}: read error: {}", chunk_id, e);
                                     break;
                                 }
                                 None => {
-                                    tracing::warn!("zoomex futures: stream ended");
+                                    tracing::warn!("zoomex futures chunk-{}: stream ended", chunk_id);
                                     break;
                                 }
                             };
@@ -354,7 +399,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Text(t) => t,
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
-                                    tracing::warn!("zoomex futures: server closed connection");
+                                    tracing::warn!("zoomex futures chunk-{}: server closed connection", chunk_id);
                                     break;
                                 }
                                 _ => continue,
@@ -363,7 +408,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ws_msg: WsMsg = match serde_json::from_str(&text) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("zoomex futures: parse error: {}", e);
+                                    tracing::warn!("zoomex futures chunk-{}: parse error: {}", chunk_id, e);
                                     continue;
                                 }
                             };
@@ -390,7 +435,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ticker: TickerData = match serde_json::from_value(data_val) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("zoomex futures: parse ticker error: {}", e);
+                                    tracing::warn!("zoomex futures chunk-{}: parse ticker error: {}", chunk_id, e);
                                     continue;
                                 }
                             };
@@ -408,7 +453,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         name: ticker.symbol.clone(),
                                         ..Default::default()
                                     };
-                                    // Apply funding info from REST
                                     if let Some((interval, max_rate)) = funding_info.get(&ticker.symbol) {
                                         ei.rate_interval = Some(*interval);
                                         ei.rate_max = Some(max_rate.clone());
@@ -449,112 +493,28 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             section.serialize_cache();
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("zoomex futures: no message for 30s, reconnecting");
+                            tracing::warn!("zoomex futures chunk-{}: no message for 30s, reconnecting", chunk_id);
                             break;
                         }
                         _ = ping_interval.tick() => {
                             let ping = serde_json::json!({"op": "ping"});
                             if let Err(e) = write.send(Message::Text(ping.to_string().into())).await {
-                                tracing::error!("zoomex futures: ping send error: {}", e);
+                                tracing::error!("zoomex futures chunk-{}: ping send error: {}", chunk_id, e);
                                 break;
                             }
-                        }
-                        _ = refresh_interval.tick() => {
-                            tracing::info!("zoomex futures: refreshing instrument list...");
-                            let new_instr = fetch_futures_instruments(&client).await;
-                            if new_instr.symbols.is_empty() {
-                                tracing::warn!("zoomex futures: refresh returned empty list, retrying in 30s");
-                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                                continue;
-                            }
-
-                            let new_symbols: HashSet<String> =
-                                new_instr.symbols.iter().cloned().collect();
-                            tracing::info!(
-                                "zoomex futures: refresh found {} symbols",
-                                new_symbols.len()
-                            );
-
-                            // Unsubscribe removed symbols
-                            let removed: Vec<String> = current_symbols
-                                .difference(&new_symbols)
-                                .cloned()
-                                .collect();
-                            if !removed.is_empty() {
-                                tracing::info!(
-                                    "zoomex futures: unsubscribing {} removed symbols",
-                                    removed.len()
-                                );
-                                for chunk in removed.chunks(10) {
-                                    let args: Vec<String> =
-                                        chunk.iter().map(|s| format!("tickers.{}", s)).collect();
-                                    let unsub = serde_json::json!({
-                                        "op": "unsubscribe",
-                                        "args": args
-                                    });
-                                    if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
-                                        tracing::error!("zoomex futures: unsub send error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Subscribe new symbols
-                            let added: Vec<String> = new_symbols
-                                .difference(&current_symbols)
-                                .cloned()
-                                .collect();
-                            if !added.is_empty() {
-                                tracing::info!(
-                                    "zoomex futures: subscribing {} new symbols",
-                                    added.len()
-                                );
-                                for chunk in added.chunks(10) {
-                                    let args: Vec<String> =
-                                        chunk.iter().map(|s| format!("tickers.{}", s)).collect();
-                                    let sub = serde_json::json!({
-                                        "op": "subscribe",
-                                        "args": args
-                                    });
-                                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                                        tracing::error!("zoomex futures: sub send error: {}", e);
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            }
-
-                            // Clean stale cache entries
-                            {
-                                let mut section = cache.zoomex_future.write().await;
-                                let before = section.items.len();
-                                section.items.retain(|k, _| new_symbols.contains(k));
-                                let removed_count = before - section.items.len();
-                                if removed_count > 0 {
-                                    tracing::info!(
-                                        "zoomex futures: removed {} stale cache entries",
-                                        removed_count
-                                    );
-                                }
-                                section.serialize_cache();
-                            }
-
-                            current_symbols = new_symbols;
-                            funding_info = new_instr.funding_info;
                         }
                     }
                 }
                 } // else !subscribe_failed
             }
             Ok(Err(e)) => {
-                tracing::error!("zoomex futures: connection failed: {}", e);
+                tracing::error!("zoomex futures chunk-{}: connection failed: {}", chunk_id, e);
             }
             Err(_) => {
-                tracing::error!("zoomex futures: connection timed out");
+                tracing::error!("zoomex futures chunk-{}: connection timed out", chunk_id);
             }
         }
-        // Clear cache on disconnect to prevent stale data
-        cache.zoomex_future.write().await.clear();
+        // Don't clear cache here — other chunks are still running
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }

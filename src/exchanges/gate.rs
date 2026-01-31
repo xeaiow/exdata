@@ -123,8 +123,9 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
     }
 }
 
-// ── Futures ────────────────────────────────────────────────────────────────
+// ── Futures (coordinator + chunk workers) ─────────────────────────────────
 
+/// Coordinator: fetches contracts, seeds REST, spawns chunk workers, restarts every 5 min.
 pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
     let mut attempt: u32 = 0;
 
@@ -142,12 +143,99 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             attempt = attempt.saturating_add(1);
             continue;
         }
+        attempt = 0;
 
-        let mut funding_info = contract_info.funding_info;
-        let mut current_symbols: HashSet<String> =
-            contract_info.symbols.iter().cloned().collect();
+        let current_symbols: HashSet<String> = contract_info.symbols.iter().cloned().collect();
 
-        tracing::info!("gate futures: connecting...");
+        // Seed bid/ask from REST
+        let futures_tickers = fetch_futures_tickers(&client).await;
+        if !futures_tickers.is_empty() {
+            let ts = now_ms();
+            let mut section = cache.gate_future.write().await;
+            for t in &futures_tickers {
+                if !current_symbols.contains(&t.contract) {
+                    continue;
+                }
+                let normalized = normalize_symbol(&t.contract);
+                let item = section
+                    .items
+                    .entry(normalized.clone())
+                    .or_insert_with(|| {
+                        let mut ei = ExchangeItem {
+                            name: normalized,
+                            ..Default::default()
+                        };
+                        if let Some((interval, max_rate)) =
+                            contract_info.funding_info.get(&t.contract)
+                        {
+                            ei.rate_interval = Some(*interval);
+                            ei.rate_max = Some(max_rate.clone());
+                        }
+                        ei
+                    });
+                item.a = parse_f64(&t.lowest_ask);
+                item.b = parse_f64(&t.highest_bid);
+                item.ts = ts;
+                item.trade24_count = parse_f64(&t.volume_24h_quote);
+            }
+            tracing::info!(
+                "gate futures: seeded {} tickers from REST",
+                section.items.len()
+            );
+            section.serialize_cache();
+        }
+
+        // Split symbols into chunks of 50 and spawn a worker for each
+        let funding_info = std::sync::Arc::new(contract_info.funding_info);
+        let chunks: Vec<Vec<String>> = contract_info
+            .symbols
+            .chunks(50)
+            .map(|c| c.to_vec())
+            .collect();
+        let num_chunks = chunks.len();
+        tracing::info!(
+            "gate futures: spawning {} chunk workers ({} symbols)",
+            num_chunks,
+            contract_info.symbols.len()
+        );
+
+        let mut handles = Vec::with_capacity(num_chunks);
+        for (idx, chunk_symbols) in chunks.into_iter().enumerate() {
+            let cache = cache.clone();
+            let funding = funding_info.clone();
+            let handle = tokio::spawn(run_chunk(cache, chunk_symbols, funding, idx));
+            handles.push(handle);
+        }
+
+        // Sleep 5 minutes, then abort all chunks and restart
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+
+        tracing::info!("gate futures: coordinator restarting, aborting {} chunks", handles.len());
+        for h in &handles {
+            h.abort();
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Clear cache before full restart
+        cache.gate_future.write().await.clear();
+    }
+}
+
+/// Chunk worker: manages a single WS connection subscribing to ≤50 symbols.
+/// Subscribes to both futures.tickers and futures.book_ticker channels.
+/// Self-reconnects on disconnect; no refresh logic (coordinator handles that).
+async fn run_chunk(
+    cache: SharedCache,
+    symbols: Vec<String>,
+    funding_info: std::sync::Arc<HashMap<String, (u32, String)>>,
+    chunk_id: usize,
+) {
+    let mut attempt: u32 = 0;
+
+    loop {
+        tracing::info!("gate futures chunk-{}: connecting ({} symbols)...", chunk_id, symbols.len());
         let url = "wss://fx-ws.gateio.ws/v4/ws/usdt";
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -156,13 +244,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         match ws_result {
             Ok(Ok((ws, _))) => {
                 attempt = 0;
-                tracing::info!("gate futures: connected");
+                tracing::info!("gate futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Subscribe to futures.tickers in batches of 50
+                // Subscribe to futures.tickers
                 let mut subscribe_failed = false;
-                for chunk in contract_info.symbols.chunks(50) {
-                    let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                {
+                    let payload: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -174,89 +262,38 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         "payload": payload
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("gate futures: tickers subscribe send error: {}", e);
+                        tracing::error!("gate futures chunk-{}: tickers subscribe send error: {}", chunk_id, e);
                         subscribe_failed = true;
-                        break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
-                // Subscribe to futures.book_ticker in batches of 50
+                // Subscribe to futures.book_ticker
                 if !subscribe_failed {
-                    for chunk in contract_info.symbols.chunks(50) {
-                        let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                        let sub = serde_json::json!({
-                            "time": now_secs,
-                            "channel": "futures.book_ticker",
-                            "event": "subscribe",
-                            "payload": payload
-                        });
-                        if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                            tracing::error!("gate futures: book_ticker subscribe send error: {}", e);
-                            subscribe_failed = true;
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let payload: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let sub = serde_json::json!({
+                        "time": now_secs,
+                        "channel": "futures.book_ticker",
+                        "event": "subscribe",
+                        "payload": payload
+                    });
+                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                        tracing::error!("gate futures chunk-{}: book_ticker subscribe send error: {}", chunk_id, e);
+                        subscribe_failed = true;
                     }
                 }
 
-                // If subscribe failed, skip straight to reconnect
                 if subscribe_failed {
-                    tracing::warn!("gate futures: subscribe failed, reconnecting...");
-                    // fall through to cache clear + backoff
+                    tracing::warn!("gate futures chunk-{}: subscribe failed, reconnecting...", chunk_id);
                 } else {
-
-                // Seed bid/ask from REST
-                let futures_tickers = fetch_futures_tickers(&client).await;
-                if !futures_tickers.is_empty() {
-                    let ts = now_ms();
-                    let mut section = cache.gate_future.write().await;
-                    for t in &futures_tickers {
-                        if !current_symbols.contains(&t.contract) {
-                            continue;
-                        }
-                        let normalized = normalize_symbol(&t.contract);
-                        let item = section
-                            .items
-                            .entry(normalized.clone())
-                            .or_insert_with(|| {
-                                let mut ei = ExchangeItem {
-                                    name: normalized,
-                                    ..Default::default()
-                                };
-                                if let Some((interval, max_rate)) =
-                                    funding_info.get(&t.contract)
-                                {
-                                    ei.rate_interval = Some(*interval);
-                                    ei.rate_max = Some(max_rate.clone());
-                                }
-                                ei
-                            });
-                        item.a = parse_f64(&t.lowest_ask);
-                        item.b = parse_f64(&t.highest_bid);
-                        item.ts = ts;
-                        item.trade24_count = parse_f64(&t.volume_24h_quote);
-                    }
-                    tracing::info!(
-                        "gate futures: seeded {} tickers from REST",
-                        section.items.len()
-                    );
-                    section.serialize_cache();
-                }
-
-                let mut refresh_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(300));
-                refresh_interval.tick().await; // consume the immediate first tick
 
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(15));
                 ping_interval.tick().await; // consume the immediate first tick
-
-                // Read loop
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
@@ -267,11 +304,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::warn!("gate futures: read error: {}", e);
+                                    tracing::warn!("gate futures chunk-{}: read error: {}", chunk_id, e);
                                     break;
                                 }
                                 None => {
-                                    tracing::warn!("gate futures: stream ended");
+                                    tracing::warn!("gate futures chunk-{}: stream ended", chunk_id);
                                     break;
                                 }
                             };
@@ -280,7 +317,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Text(t) => t,
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
-                                    tracing::warn!("gate futures: server closed connection");
+                                    tracing::warn!("gate futures chunk-{}: server closed connection", chunk_id);
                                     break;
                                 }
                                 _ => continue,
@@ -291,7 +328,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ws_msg: GateWsMsg = match serde_json::from_str(text_str) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("gate futures: parse error: {}", e);
+                                    tracing::warn!("gate futures chunk-{}: parse error: {}", chunk_id, e);
                                     continue;
                                 }
                             };
@@ -316,14 +353,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
                             match channel {
                                 "futures.tickers" => {
-                                    // futures.tickers result is an array
                                     let items: Vec<serde_json::Value> = match serde_json::from_value(result)
                                     {
                                         Ok(v) => v,
                                         Err(e) => {
                                             tracing::warn!(
-                                                "gate futures: parse tickers array error: {}",
-                                                e
+                                                "gate futures chunk-{}: parse tickers array error: {}",
+                                                chunk_id, e
                                             );
                                             continue;
                                         }
@@ -347,7 +383,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                             .get("volume_24h_quote")
                                             .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "0")))
                                             .unwrap_or("0");
-                                        // Handle both string and number for volume
                                         let volume_val = if let Some(s) = ticker.get("volume_24h_quote") {
                                             match s {
                                                 serde_json::Value::String(sv) => parse_f64(sv),
@@ -398,7 +433,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                         item.mark_price = Some(mark_price.to_string());
                                         item.index_price = Some(index_price.to_string());
 
-                                        // Ensure funding info stays applied
                                         if item.rate_interval.is_none() {
                                             if let Some((interval, max_rate)) =
                                                 funding_info.get(contract)
@@ -411,7 +445,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     section.serialize_cache();
                                 }
                                 "futures.book_ticker" => {
-                                    // futures.book_ticker result uses "s" for contract name
                                     let contract = result
                                         .get("s")
                                         .and_then(|v| v.as_str())
@@ -455,7 +488,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     item.b = parse_f64(bid);
                                     item.ts = ts;
 
-                                    // Ensure funding info stays applied
                                     if item.rate_interval.is_none() {
                                         if let Some((interval, max_rate)) =
                                             funding_info.get(contract)
@@ -466,13 +498,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                     }
                                     section.serialize_cache();
                                 }
-                                _ => {
-                                    tracing::warn!("gate futures: unknown channel: {}", channel);
-                                }
+                                _ => {}
                             }
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("gate futures: no message for 30s, reconnecting");
+                            tracing::warn!("gate futures chunk-{}: no message for 30s, reconnecting", chunk_id);
                             break;
                         }
                         _ = ping_interval.tick() => {
@@ -485,142 +515,22 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 "channel": "futures.ping"
                             });
                             if let Err(e) = write.send(Message::Text(ping.to_string().into())).await {
-                                tracing::error!("gate futures: ping send error: {}", e);
+                                tracing::error!("gate futures chunk-{}: ping send error: {}", chunk_id, e);
                                 break;
                             }
-                        }
-                        _ = refresh_interval.tick() => {
-                            tracing::info!("gate futures: refreshing contracts list...");
-                            let new_contract_info = fetch_futures_contracts(&client).await;
-                            if new_contract_info.symbols.is_empty() {
-                                tracing::warn!("gate futures: refresh returned empty list, retrying in 30s");
-                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                                continue;
-                            }
-
-                            let new_symbols: HashSet<String> =
-                                new_contract_info.symbols.iter().cloned().collect();
-                            tracing::info!(
-                                "gate futures: refresh found {} contracts",
-                                new_symbols.len()
-                            );
-
-                            // Unsubscribe removed symbols from both channels
-                            let removed: Vec<String> = current_symbols
-                                .difference(&new_symbols)
-                                .cloned()
-                                .collect();
-                            if !removed.is_empty() {
-                                tracing::info!(
-                                    "gate futures: unsubscribing {} removed symbols",
-                                    removed.len()
-                                );
-                                for chunk in removed.chunks(50) {
-                                    let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                                    let now_secs = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs();
-                                    let unsub_tickers = serde_json::json!({
-                                        "time": now_secs,
-                                        "channel": "futures.tickers",
-                                        "event": "unsubscribe",
-                                        "payload": payload
-                                    });
-                                    if let Err(e) = write.send(Message::Text(unsub_tickers.to_string().into())).await {
-                                        tracing::error!("gate futures: unsub tickers send error: {}", e);
-                                        break;
-                                    }
-                                    let unsub_book = serde_json::json!({
-                                        "time": now_secs,
-                                        "channel": "futures.book_ticker",
-                                        "event": "unsubscribe",
-                                        "payload": payload
-                                    });
-                                    if let Err(e) = write.send(Message::Text(unsub_book.to_string().into())).await {
-                                        tracing::error!("gate futures: unsub book_ticker send error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Subscribe new symbols to both channels
-                            let added: Vec<String> = new_symbols
-                                .difference(&current_symbols)
-                                .cloned()
-                                .collect();
-                            if !added.is_empty() {
-                                tracing::info!(
-                                    "gate futures: subscribing {} new symbols",
-                                    added.len()
-                                );
-                                for chunk in added.chunks(50) {
-                                    let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                                    let now_secs = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs();
-                                    let sub_tickers = serde_json::json!({
-                                        "time": now_secs,
-                                        "channel": "futures.tickers",
-                                        "event": "subscribe",
-                                        "payload": payload
-                                    });
-                                    if let Err(e) = write.send(Message::Text(sub_tickers.to_string().into())).await {
-                                        tracing::error!("gate futures: sub tickers send error: {}", e);
-                                        break;
-                                    }
-                                    let sub_book = serde_json::json!({
-                                        "time": now_secs,
-                                        "channel": "futures.book_ticker",
-                                        "event": "subscribe",
-                                        "payload": payload
-                                    });
-                                    if let Err(e) = write.send(Message::Text(sub_book.to_string().into())).await {
-                                        tracing::error!("gate futures: sub book_ticker send error: {}", e);
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            }
-
-                            // Clean stale cache entries
-                            // Cache keys are normalized (e.g. "BTCUSDT") but symbols are
-                            // Gate format (e.g. "BTC_USDT"), so build valid normalized set
-                            {
-                                let valid_normalized: HashSet<String> = new_symbols
-                                    .iter()
-                                    .map(|s| normalize_symbol(s))
-                                    .collect();
-                                let mut section = cache.gate_future.write().await;
-                                let before = section.items.len();
-                                section.items.retain(|k, _| valid_normalized.contains(k));
-                                let removed_count = before - section.items.len();
-                                if removed_count > 0 {
-                                    tracing::info!(
-                                        "gate futures: removed {} stale cache entries",
-                                        removed_count
-                                    );
-                                }
-                                section.serialize_cache();
-                            }
-
-                            current_symbols = new_symbols;
-                            funding_info = new_contract_info.funding_info;
                         }
                     }
                 }
                 } // else !subscribe_failed
             }
             Ok(Err(e)) => {
-                tracing::error!("gate futures: connection failed: {}", e);
+                tracing::error!("gate futures chunk-{}: connection failed: {}", chunk_id, e);
             }
             Err(_) => {
-                tracing::error!("gate futures: connection timed out");
+                tracing::error!("gate futures chunk-{}: connection timed out", chunk_id);
             }
         }
-        // Clear cache on disconnect to prevent stale data
-        cache.gate_future.write().await.clear();
+        // Don't clear cache here — other chunks are still running
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }
