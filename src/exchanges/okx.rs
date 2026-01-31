@@ -175,6 +175,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 }
 
                 // Subscribe in batches of 50 args per message
+                let mut subscribe_failed = false;
                 for chunk in all_args.chunks(50) {
                     let sub = serde_json::json!({
                         "op": "subscribe",
@@ -182,10 +183,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
                         tracing::error!("okx futures: subscribe send error: {}", e);
+                        subscribe_failed = true;
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+
+                if subscribe_failed {
+                    tracing::warn!("okx futures: subscribe failed, reconnecting...");
+                } else {
 
                 // Seed bid/ask from REST
                 let swap_tickers = fetch_swap_tickers(&client).await;
@@ -504,6 +510,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         }
                     }
                 }
+                } // else !subscribe_failed
             }
             Ok(Err(e)) => {
                 tracing::error!("okx futures: connection failed: {}", e);

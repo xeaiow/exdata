@@ -217,6 +217,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe in batches of 10
+                let mut subscribe_failed = false;
                 for chunk in instr.symbols.chunks(10) {
                     let args: Vec<String> =
                         chunk.iter().map(|s| format!("tickers.{}", s)).collect();
@@ -226,10 +227,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
                         tracing::error!("bybit futures: subscribe send error: {}", e);
+                        subscribe_failed = true;
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+
+                if subscribe_failed {
+                    tracing::warn!("bybit futures: subscribe failed, reconnecting...");
+                } else {
 
                 // Seed bid/ask from REST
                 let futures_tickers = fetch_futures_tickers(&client).await;
@@ -484,6 +490,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         }
                     }
                 }
+                } // else !subscribe_failed
             }
             Ok(Err(e)) => {
                 tracing::error!("bybit futures: connection failed: {}", e);

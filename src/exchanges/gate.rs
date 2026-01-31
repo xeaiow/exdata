@@ -160,6 +160,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe to futures.tickers in batches of 50
+                let mut subscribe_failed = false;
                 for chunk in contract_info.symbols.chunks(50) {
                     let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
                     let now_secs = std::time::SystemTime::now()
@@ -174,30 +175,40 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
                         tracing::error!("gate futures: tickers subscribe send error: {}", e);
+                        subscribe_failed = true;
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
                 // Subscribe to futures.book_ticker in batches of 50
-                for chunk in contract_info.symbols.chunks(50) {
-                    let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let sub = serde_json::json!({
-                        "time": now_secs,
-                        "channel": "futures.book_ticker",
-                        "event": "subscribe",
-                        "payload": payload
-                    });
-                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("gate futures: book_ticker subscribe send error: {}", e);
-                        break;
+                if !subscribe_failed {
+                    for chunk in contract_info.symbols.chunks(50) {
+                        let payload: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let sub = serde_json::json!({
+                            "time": now_secs,
+                            "channel": "futures.book_ticker",
+                            "event": "subscribe",
+                            "payload": payload
+                        });
+                        if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                            tracing::error!("gate futures: book_ticker subscribe send error: {}", e);
+                            subscribe_failed = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+
+                // If subscribe failed, skip straight to reconnect
+                if subscribe_failed {
+                    tracing::warn!("gate futures: subscribe failed, reconnecting...");
+                    // fall through to cache clear + backoff
+                } else {
 
                 // Seed bid/ask from REST
                 let futures_tickers = fetch_futures_tickers(&client).await;
@@ -598,6 +609,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         }
                     }
                 }
+                } // else !subscribe_failed
             }
             Ok(Err(e)) => {
                 tracing::error!("gate futures: connection failed: {}", e);
