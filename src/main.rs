@@ -4,6 +4,7 @@ mod config;
 mod exchanges;
 mod models;
 mod validator;
+mod spread;
 
 use axum::{Router, routing::get};
 use cache::{Cache, SharedCache};
