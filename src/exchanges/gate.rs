@@ -442,7 +442,7 @@ async fn run_chunk(
                                             }
                                         }
                                     }
-                                    section.serialize_cache();
+                                    section.dirty = true;
                                 }
                                 "futures.book_ticker" => {
                                     let contract = result
@@ -496,7 +496,7 @@ async fn run_chunk(
                                             item.rate_max = Some(max_rate.clone());
                                         }
                                     }
-                                    section.serialize_cache();
+                                    section.dirty = true;
                                 }
                                 _ => {}
                             }

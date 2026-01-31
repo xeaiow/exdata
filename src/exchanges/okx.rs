@@ -396,7 +396,7 @@ async fn run_chunk(
                                     item.b = parse_f64(bid_px);
                                     item.ts = ts;
                                     item.trade24_count = parse_f64(vol_ccy);
-                                    section.serialize_cache();
+                                    section.dirty = true;
                                 }
                                 "funding-rate" => {
                                     let inst_id = data
@@ -444,7 +444,7 @@ async fn run_chunk(
                                     if interval > 0 {
                                         item.rate_interval = Some(interval);
                                     }
-                                    section.serialize_cache();
+                                    section.dirty = true;
                                 }
                                 _ => {
                                     tracing::warn!(

@@ -437,7 +437,7 @@ async fn run_chunk(
                                     item.rate_max = Some(max_rate.clone());
                                 }
                             }
-                            section.serialize_cache();
+                            section.dirty = true;
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
                             tracing::warn!("bybit futures chunk-{}: no message for 30s, reconnecting", chunk_id);

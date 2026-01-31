@@ -298,7 +298,7 @@ async fn run_chunk(
                                     item.rate_interval = Some(*interval);
                                     item.rate_max = Some(max_rate.clone());
                                 }
-                                section.serialize_cache();
+                                section.dirty = true;
                             } else if stream == "!ticker@arr" {
                                 let tickers: Vec<FuturesTicker> =
                                     match serde_json::from_value(combined.data) {
@@ -330,7 +330,7 @@ async fn run_chunk(
                                         item.rate_max = Some(max_rate.clone());
                                     }
                                 }
-                                section.serialize_cache();
+                                section.dirty = true;
                             } else if stream.contains("markPrice") {
                                 let updates: Vec<MarkPriceUpdate> =
                                     match serde_json::from_value(combined.data) {
@@ -366,7 +366,7 @@ async fn run_chunk(
                                         item.rate_max = Some(max_rate.clone());
                                     }
                                 }
-                                section.serialize_cache();
+                                section.dirty = true;
                             } else {
                                 tracing::warn!("binance futures chunk-{}: unknown stream: {}", chunk_id, stream);
                             }

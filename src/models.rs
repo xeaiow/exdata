@@ -30,6 +30,8 @@ pub struct ExchangeSection {
     pub items: HashMap<String, ExchangeItem>,
     /// Pre-serialized JSON for this section, updated on every write.
     pub cached_json: String,
+    /// Whether items have been modified since the last serialize_cache() call.
+    pub dirty: bool,
 }
 
 impl ExchangeSection {
@@ -38,6 +40,7 @@ impl ExchangeSection {
             ts: 0,
             items: HashMap::new(),
             cached_json: String::new(),
+            dirty: false,
         };
         s.serialize_cache();
         s
@@ -48,6 +51,7 @@ impl ExchangeSection {
     pub fn clear(&mut self) {
         self.ts = 0;
         self.items.clear();
+        self.dirty = false;
         self.serialize_cache();
     }
 
