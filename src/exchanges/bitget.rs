@@ -80,6 +80,45 @@ async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<SpotTickerItem> 
     body.data
 }
 
+/// Fetch max funding rates from the current-fund-rate endpoint.
+/// Returns symbol -> maxFundingRate (as percentage string, e.g. "0.300").
+async fn fetch_max_funding_rates(client: &reqwest::Client) -> HashMap<String, String> {
+    #[derive(Deserialize)]
+    struct FundRateResponse {
+        data: Vec<FundRateItem>,
+    }
+    #[derive(Deserialize)]
+    struct FundRateItem {
+        symbol: String,
+        #[serde(rename = "maxFundingRate", default)]
+        max_funding_rate: Option<String>,
+    }
+
+    let url = "https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES";
+    let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("bitget futures: funding rates fetch failed: {}", e);
+            return HashMap::new();
+        }
+    };
+    let body: FundRateResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("bitget futures: funding rates parse failed: {}", e);
+            return HashMap::new();
+        }
+    };
+    let mut map = HashMap::with_capacity(body.data.len());
+    for item in body.data {
+        if let Some(ref max_rate) = item.max_funding_rate {
+            let v = parse_f64(max_rate);
+            map.insert(item.symbol, format!("{:.3}", v * 100.0));
+        }
+    }
+    map
+}
+
 /// Funding info for futures: symbol -> (interval_hours, rate_max_str).
 struct FuturesInstrumentData {
     symbols: Vec<String>,
@@ -146,7 +185,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 
     loop {
         tracing::info!("bitget futures: fetching contracts list...");
-        let instr = fetch_futures_contracts(&client).await;
+        let mut instr = fetch_futures_contracts(&client).await;
         tracing::info!(
             "bitget futures: found {} USDT-FUTURES contracts",
             instr.symbols.len()
@@ -159,6 +198,17 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             continue;
         }
         attempt = 0;
+
+        // Fetch max funding rates and merge into funding_info
+        let max_rates = fetch_max_funding_rates(&client).await;
+        if !max_rates.is_empty() {
+            tracing::info!("bitget futures: loaded max funding rates for {} symbols", max_rates.len());
+            for (sym, max_rate) in &max_rates {
+                if let Some(info) = instr.funding_info.get_mut(sym) {
+                    info.1 = max_rate.clone();
+                }
+            }
+        }
 
         let current_symbols: HashSet<String> = instr.symbols.iter().cloned().collect();
 
