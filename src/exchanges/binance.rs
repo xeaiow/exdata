@@ -106,69 +106,130 @@ async fn fetch_book_tickers(client: &reqwest::Client) -> Vec<RestBookTicker> {
     }
 }
 
-// ── Futures ─────────────────────────────────────────────────────────────────
+// ── Futures (coordinator + chunk worker) ────────────────────────────────────
 
+/// Coordinator: fetches funding info, seeds REST, spawns single chunk worker, restarts every 5 min.
 pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
     let mut attempt: u32 = 0;
+
     loop {
         tracing::info!("binance futures: fetching funding info...");
-        let mut funding_info = fetch_funding_info(&client).await;
+        let funding_info = fetch_funding_info(&client).await;
         tracing::info!(
             "binance futures: loaded funding info for {} symbols",
             funding_info.len()
         );
 
-        tracing::info!("binance futures: connecting...");
-        let url = "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker";
+        if funding_info.is_empty() {
+            tracing::warn!("binance futures: no funding info found, retrying...");
+            backoff_sleep(attempt).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+        attempt = 0;
+
+        // Build valid symbols from funding info keys (USDT only)
+        let valid_symbols: Vec<String> = funding_info
+            .keys()
+            .filter(|s| s.ends_with("USDT"))
+            .cloned()
+            .collect();
+
+        // Seed bid/ask from REST
+        let book_tickers = fetch_book_tickers(&client).await;
+        if !book_tickers.is_empty() {
+            let valid_set: HashSet<&String> = valid_symbols.iter().collect();
+            let ts = now_ms();
+            let mut section = cache.binance_future.write().await;
+            for bt in &book_tickers {
+                if !valid_set.contains(&bt.symbol) {
+                    continue;
+                }
+                let item = section
+                    .items
+                    .entry(bt.symbol.clone())
+                    .or_insert_with(|| {
+                        let mut ei = ExchangeItem {
+                            name: bt.symbol.clone(),
+                            ..Default::default()
+                        };
+                        if let Some((interval, max_rate)) = funding_info.get(&bt.symbol) {
+                            ei.rate_interval = Some(*interval);
+                            ei.rate_max = Some(max_rate.clone());
+                        }
+                        ei
+                    });
+                item.a = parse_f64(&bt.ask_price);
+                item.b = parse_f64(&bt.bid_price);
+                item.ts = ts;
+            }
+            tracing::info!(
+                "binance futures: seeded {} book tickers from REST",
+                section.items.len()
+            );
+            section.serialize_cache();
+        }
+
+        // Spawn single chunk worker (Binance uses array broadcast, no per-symbol sub)
+        let funding_info = std::sync::Arc::new(funding_info);
+        tracing::info!(
+            "binance futures: spawning single chunk worker ({} symbols)",
+            valid_symbols.len()
+        );
+        let handle = tokio::spawn(run_chunk(
+            cache.clone(),
+            valid_symbols,
+            funding_info,
+            0,
+        ));
+
+        // Sleep 5 minutes, then abort and restart
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+
+        tracing::info!("binance futures: coordinator restarting, aborting worker");
+        handle.abort();
+        let _ = handle.await;
+
+        // Clear cache before full restart
+        cache.binance_future.write().await.clear();
+    }
+}
+
+/// Single chunk worker: manages WS connection to Binance array broadcast streams.
+/// Self-reconnects on disconnect; coordinator handles instrument refresh.
+async fn run_chunk(
+    cache: SharedCache,
+    symbols: Vec<String>,
+    funding_info: std::sync::Arc<HashMap<String, (u32, String)>>,
+    chunk_id: usize,
+) {
+    let valid_set: HashSet<String> = symbols.into_iter().collect();
+    let mut attempt: u32 = 0;
+
+    loop {
+        tracing::info!(
+            "binance futures chunk-{}: connecting ({} symbols)...",
+            chunk_id,
+            valid_set.len()
+        );
+        let url =
+            "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker";
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             connect_async(url),
-        ).await;
+        )
+        .await;
         match ws_result {
             Ok(Ok((ws, _))) => {
                 attempt = 0;
-                tracing::info!("binance futures: connected");
-
-                // Seed bid/ask from REST before entering the WS loop
-                let book_tickers = fetch_book_tickers(&client).await;
-                if !book_tickers.is_empty() {
-                    let mut section = cache.binance_future.write().await;
-                    for bt in &book_tickers {
-                        if !bt.symbol.ends_with("USDT") {
-                            continue;
-                        }
-                        let item =
-                            section.items.entry(bt.symbol.clone()).or_insert_with(|| {
-                                ExchangeItem {
-                                    name: bt.symbol.clone(),
-                                    ..Default::default()
-                                }
-                            });
-                        item.a = parse_f64(&bt.ask_price);
-                        item.b = parse_f64(&bt.bid_price);
-                        item.ts = now_ms();
-                    }
-                    tracing::info!(
-                        "binance futures: seeded {} book tickers from REST",
-                        section.items.len()
-                    );
-                    section.serialize_cache();
-                }
-
+                tracing::info!("binance futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
                 let connect_time = tokio::time::Instant::now();
 
-                let mut refresh_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(300));
-                refresh_interval.tick().await; // consume the immediate first tick
-                if funding_info.is_empty() {
-                    refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                }
-
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
-                ping_interval.tick().await; // consume the immediate first tick
+                ping_interval.tick().await;
 
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -180,11 +241,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::warn!("binance futures: read error: {}", e);
+                                    tracing::warn!("binance futures chunk-{}: read error: {}", chunk_id, e);
                                     break;
                                 }
                                 None => {
-                                    tracing::warn!("binance futures: stream ended");
+                                    tracing::warn!("binance futures chunk-{}: stream ended", chunk_id);
                                     break;
                                 }
                             };
@@ -193,7 +254,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Text(t) => t,
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
-                                    tracing::warn!("binance futures: server closed connection");
+                                    tracing::warn!("binance futures chunk-{}: server closed connection", chunk_id);
                                     break;
                                 }
                                 _ => continue,
@@ -202,7 +263,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let combined: CombinedMsg = match serde_json::from_str(&text) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("binance futures: parse combined msg error: {}", e);
+                                    tracing::warn!("binance futures chunk-{}: parse combined msg error: {}", chunk_id, e);
                                     continue;
                                 }
                             };
@@ -211,15 +272,14 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ts = now_ms();
 
                             if stream == "!bookTicker" {
-                                // Single object
                                 let bt: FuturesBookTicker = match serde_json::from_value(combined.data) {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        tracing::warn!("binance futures: parse bookTicker error: {}", e);
+                                        tracing::warn!("binance futures chunk-{}: parse bookTicker error: {}", chunk_id, e);
                                         continue;
                                     }
                                 };
-                                if !bt.s.ends_with("USDT") {
+                                if !valid_set.contains(&bt.s) {
                                     continue;
                                 }
                                 let mut section = cache.binance_future.write().await;
@@ -234,21 +294,19 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 item.a = parse_f64(&bt.a);
                                 item.b = parse_f64(&bt.b);
                                 item.ts = ts;
-                                // Apply funding info
                                 if let Some((interval, max_rate)) = funding_info.get(&bt.s) {
                                     item.rate_interval = Some(*interval);
                                     item.rate_max = Some(max_rate.clone());
                                 }
                                 section.serialize_cache();
                             } else if stream == "!ticker@arr" {
-                                // Array of ticker objects
                                 let tickers: Vec<FuturesTicker> =
                                     match serde_json::from_value(combined.data) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             tracing::warn!(
-                                                "binance futures: parse ticker array error: {}",
-                                                e
+                                                "binance futures chunk-{}: parse ticker array error: {}",
+                                                chunk_id, e
                                             );
                                             continue;
                                         }
@@ -256,7 +314,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 let mut section = cache.binance_future.write().await;
                                 section.ts = ts;
                                 for t in &tickers {
-                                    if !t.s.ends_with("USDT") {
+                                    if !valid_set.contains(&t.s) {
                                         continue;
                                     }
                                     let item = section
@@ -274,14 +332,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 }
                                 section.serialize_cache();
                             } else if stream.contains("markPrice") {
-                                // Array of markPriceUpdate objects
                                 let updates: Vec<MarkPriceUpdate> =
                                     match serde_json::from_value(combined.data) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             tracing::warn!(
-                                                "binance futures: parse markPrice array error: {}",
-                                                e
+                                                "binance futures chunk-{}: parse markPrice array error: {}",
+                                                chunk_id, e
                                             );
                                             continue;
                                         }
@@ -289,7 +346,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 let mut section = cache.binance_future.write().await;
                                 section.ts = ts;
                                 for u in &updates {
-                                    if !u.s.ends_with("USDT") {
+                                    if !valid_set.contains(&u.s) {
                                         continue;
                                     }
                                     let rate_dec = parse_f64(&u.r);
@@ -311,91 +368,34 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 }
                                 section.serialize_cache();
                             } else {
-                                tracing::warn!("binance futures: unknown stream: {}", stream);
+                                tracing::warn!("binance futures chunk-{}: unknown stream: {}", chunk_id, stream);
                             }
                         }
                         _ = ping_interval.tick() => {
                             if let Err(e) = write.send(Message::Ping(vec![].into())).await {
-                                tracing::error!("binance futures: ping send error: {}", e);
+                                tracing::error!("binance futures chunk-{}: ping send error: {}", chunk_id, e);
                                 break;
                             }
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("binance futures: no message for 30s, reconnecting");
+                            tracing::warn!("binance futures chunk-{}: no message for 30s, reconnecting", chunk_id);
                             break;
                         }
                         _ = tokio::time::sleep_until(connect_time + std::time::Duration::from_secs(85500)) => {
-                            tracing::info!("binance futures: approaching 24h limit, proactively reconnecting");
+                            tracing::info!("binance futures chunk-{}: approaching 24h limit, proactively reconnecting", chunk_id);
                             break;
-                        }
-                        _ = refresh_interval.tick() => {
-                            tracing::info!("binance futures: refreshing instrument list...");
-                            let new_funding = fetch_funding_info(&client).await;
-                            if new_funding.is_empty() {
-                                tracing::warn!("binance futures: refresh returned empty funding info, retrying in 30s");
-                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                                continue;
-                            }
-                            let new_book = fetch_book_tickers(&client).await;
-
-                            // Build valid symbol set from funding info keys
-                            let valid_symbols: HashSet<&String> = new_funding.keys().collect();
-                            tracing::info!(
-                                "binance futures: refresh found {} symbols",
-                                valid_symbols.len()
-                            );
-
-                            // Clean stale cache entries and seed new book tickers
-                            {
-                                let mut section = cache.binance_future.write().await;
-                                let before = section.items.len();
-                                section.items.retain(|k, _| valid_symbols.contains(k));
-                                let removed = before - section.items.len();
-                                if removed > 0 {
-                                    tracing::info!(
-                                        "binance futures: removed {} stale cache entries",
-                                        removed
-                                    );
-                                }
-
-                                // Seed bid/ask for new symbols and update existing items with a=0
-                                let seed_ts = now_ms();
-                                for bt in &new_book {
-                                    if !bt.symbol.ends_with("USDT") {
-                                        continue;
-                                    }
-                                    let item = section
-                                        .items
-                                        .entry(bt.symbol.clone())
-                                        .or_insert_with(|| ExchangeItem {
-                                            name: bt.symbol.clone(),
-                                            ..Default::default()
-                                        });
-                                    // Only seed from REST if bid/ask is still zero
-                                    // (avoid overwriting fresher WS data)
-                                    if item.a == 0.0 && item.b == 0.0 {
-                                        item.a = parse_f64(&bt.ask_price);
-                                        item.b = parse_f64(&bt.bid_price);
-                                        item.ts = seed_ts;
-                                    }
-                                }
-                                section.serialize_cache();
-                            }
-
-                            funding_info = new_funding;
                         }
                     }
                 }
             }
             Ok(Err(e)) => {
-                tracing::error!("binance futures: connection failed: {}", e);
+                tracing::error!("binance futures chunk-{}: connection failed: {}", chunk_id, e);
             }
             Err(_) => {
-                tracing::error!("binance futures: connection timed out");
+                tracing::error!("binance futures chunk-{}: connection timed out", chunk_id);
             }
         }
-        // Clear cache on disconnect to prevent stale data
-        cache.binance_future.write().await.clear();
+        // Don't clear cache — coordinator handles that
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }

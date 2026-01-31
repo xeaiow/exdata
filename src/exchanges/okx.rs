@@ -126,8 +126,9 @@ async fn fetch_swap_instruments(client: &reqwest::Client) -> Vec<String> {
         .collect()
 }
 
-// ── Futures (Swap) ──────────────────────────────────────────────────────────
+// ── Futures (coordinator + chunk workers) ────────────────────────────────────
 
+/// Coordinator: fetches instruments, seeds REST, spawns chunk workers, restarts every 5 min.
 pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
     let mut attempt: u32 = 0;
 
@@ -145,25 +146,108 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             attempt = attempt.saturating_add(1);
             continue;
         }
+        attempt = 0;
 
-        let mut current_instruments: HashSet<String> =
-            instruments.iter().cloned().collect();
+        // Seed bid/ask from REST
+        let swap_tickers = fetch_swap_tickers(&client).await;
+        if !swap_tickers.is_empty() {
+            let instruments_set: HashSet<&String> = instruments.iter().collect();
+            let ts = now_ms();
+            let mut section = cache.okx_future.write().await;
+            for t in &swap_tickers {
+                if !instruments_set.contains(&t.inst_id) {
+                    continue;
+                }
+                let normalized = normalize_swap(&t.inst_id);
+                let item = section
+                    .items
+                    .entry(normalized.clone())
+                    .or_insert_with(|| ExchangeItem {
+                        name: normalized,
+                        rate_interval: Some(0),
+                        rate_max: Some("--".to_string()),
+                        ..Default::default()
+                    });
+                item.a = parse_f64(&t.ask_px);
+                item.b = parse_f64(&t.bid_px);
+                item.ts = ts;
+                item.trade24_count = parse_f64(&t.vol_ccy_24h);
+            }
+            tracing::info!(
+                "okx futures: seeded {} tickers from REST",
+                section.items.len()
+            );
+            section.serialize_cache();
+        }
 
-        tracing::info!("okx futures: connecting...");
+        // Split instruments into chunks of 50 and spawn a worker for each
+        let chunks: Vec<Vec<String>> = instruments
+            .chunks(50)
+            .map(|c| c.to_vec())
+            .collect();
+        let num_chunks = chunks.len();
+        tracing::info!(
+            "okx futures: spawning {} chunk workers ({} symbols)",
+            num_chunks,
+            instruments.len()
+        );
+
+        let mut handles = Vec::with_capacity(num_chunks);
+        for (idx, chunk_symbols) in chunks.into_iter().enumerate() {
+            let cache = cache.clone();
+            let handle = tokio::spawn(run_chunk(cache, chunk_symbols, idx));
+            handles.push(handle);
+        }
+
+        // Sleep 5 minutes, then abort all chunks and restart
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+
+        tracing::info!(
+            "okx futures: coordinator restarting, aborting {} chunks",
+            handles.len()
+        );
+        for h in &handles {
+            h.abort();
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Clear cache before full restart
+        cache.okx_future.write().await.clear();
+    }
+}
+
+/// Chunk worker: manages a single WS connection subscribing to ≤50 symbols.
+/// Self-reconnects on disconnect; coordinator handles instrument refresh.
+async fn run_chunk(
+    cache: SharedCache,
+    symbols: Vec<String>,
+    chunk_id: usize,
+) {
+    let mut attempt: u32 = 0;
+
+    loop {
+        tracing::info!(
+            "okx futures chunk-{}: connecting ({} symbols)...",
+            chunk_id,
+            symbols.len()
+        );
         let url = "wss://ws.okx.com:8443/ws/v5/public";
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             connect_async(url),
-        ).await;
+        )
+        .await;
         match ws_result {
             Ok(Ok((ws, _))) => {
                 attempt = 0;
-                tracing::info!("okx futures: connected");
+                tracing::info!("okx futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for tickers + funding-rate channels.
+                // Build subscription args for tickers + funding-rate channels
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
-                for inst_id in &instruments {
+                for inst_id in &symbols {
                     all_args.push(serde_json::json!({
                         "channel": "tickers",
                         "instId": inst_id
@@ -182,7 +266,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                         "args": chunk
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("okx futures: subscribe send error: {}", e);
+                        tracing::error!(
+                            "okx futures chunk-{}: subscribe send error: {}",
+                            chunk_id,
+                            e
+                        );
                         subscribe_failed = true;
                         break;
                     }
@@ -190,48 +278,19 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 }
 
                 if subscribe_failed {
-                    tracing::warn!("okx futures: subscribe failed, reconnecting...");
-                } else {
-
-                // Seed bid/ask from REST
-                let swap_tickers = fetch_swap_tickers(&client).await;
-                if !swap_tickers.is_empty() {
-                    let instruments_set: HashSet<&String> = instruments.iter().collect();
-                    let ts = now_ms();
-                    let mut section = cache.okx_future.write().await;
-                    for t in &swap_tickers {
-                        if !instruments_set.contains(&t.inst_id) {
-                            continue;
-                        }
-                        let normalized = normalize_swap(&t.inst_id);
-                        let item = section
-                            .items
-                            .entry(normalized.clone())
-                            .or_insert_with(|| ExchangeItem {
-                                name: normalized,
-                                rate_interval: Some(0),
-                                rate_max: Some("--".to_string()),
-                                ..Default::default()
-                            });
-                        item.a = parse_f64(&t.ask_px);
-                        item.b = parse_f64(&t.bid_px);
-                        item.ts = ts;
-                        item.trade24_count = parse_f64(&t.vol_ccy_24h);
-                    }
-                    tracing::info!(
-                        "okx futures: seeded {} tickers from REST",
-                        section.items.len()
+                    tracing::warn!(
+                        "okx futures chunk-{}: subscribe failed, reconnecting...",
+                        chunk_id
                     );
-                    section.serialize_cache();
+                    backoff_sleep(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
                 }
 
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(25));
-                ping_interval.tick().await; // consume the immediate first tick
+                ping_interval.tick().await;
 
-                let mut refresh_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(300));
-                refresh_interval.tick().await; // consume the immediate first tick
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
@@ -242,11 +301,11 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let msg = match msg {
                                 Some(Ok(m)) => m,
                                 Some(Err(e)) => {
-                                    tracing::warn!("okx futures: read error: {}", e);
+                                    tracing::warn!("okx futures chunk-{}: read error: {}", chunk_id, e);
                                     break;
                                 }
                                 None => {
-                                    tracing::warn!("okx futures: stream ended");
+                                    tracing::warn!("okx futures chunk-{}: stream ended", chunk_id);
                                     break;
                                 }
                             };
@@ -255,7 +314,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 Message::Text(t) => t,
                                 Message::Ping(_) | Message::Pong(_) => continue,
                                 Message::Close(_) => {
-                                    tracing::warn!("okx futures: server closed connection");
+                                    tracing::warn!("okx futures chunk-{}: server closed connection", chunk_id);
                                     break;
                                 }
                                 _ => continue,
@@ -270,7 +329,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             let ws_msg: WsMsg = match serde_json::from_str(text_str) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::warn!("okx futures: parse error: {}", e);
+                                    tracing::warn!("okx futures chunk-{}: parse error: {}", chunk_id, e);
                                     continue;
                                 }
                             };
@@ -278,7 +337,10 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                             // Handle event messages
                             if ws_msg.event.is_some() {
                                 if ws_msg.code.as_deref() == Some("64008") {
-                                    tracing::warn!("okx futures: maintenance warning (64008), reconnecting in 5s...");
+                                    tracing::warn!(
+                                        "okx futures chunk-{}: maintenance warning (64008), reconnecting in 5s...",
+                                        chunk_id
+                                    );
                                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                     break;
                                 }
@@ -386,142 +448,35 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                                 }
                                 _ => {
                                     tracing::warn!(
-                                        "okx futures: unknown channel: {}",
+                                        "okx futures chunk-{}: unknown channel: {}",
+                                        chunk_id,
                                         channel
                                     );
                                 }
                             }
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
-                            tracing::warn!("okx futures: no message for 30s, reconnecting");
+                            tracing::warn!("okx futures chunk-{}: no message for 30s, reconnecting", chunk_id);
                             break;
                         }
                         _ = ping_interval.tick() => {
                             // OKX uses plain text "ping" for heartbeat
                             if let Err(e) = write.send(Message::Text("ping".into())).await {
-                                tracing::error!("okx futures: ping send error: {}", e);
+                                tracing::error!("okx futures chunk-{}: ping send error: {}", chunk_id, e);
                                 break;
                             }
                         }
-                        _ = refresh_interval.tick() => {
-                            tracing::info!("okx futures: refreshing instrument list...");
-                            let new_instruments_vec = fetch_swap_instruments(&client).await;
-                            if new_instruments_vec.is_empty() {
-                                tracing::warn!("okx futures: refresh returned empty list, retrying in 30s");
-                                refresh_interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                                continue;
-                            }
-
-                            let new_instruments: HashSet<String> =
-                                new_instruments_vec.iter().cloned().collect();
-                            tracing::info!(
-                                "okx futures: refresh found {} instruments",
-                                new_instruments.len()
-                            );
-
-                            // Unsubscribe removed instruments (both tickers + funding-rate)
-                            let removed: Vec<String> = current_instruments
-                                .difference(&new_instruments)
-                                .cloned()
-                                .collect();
-                            if !removed.is_empty() {
-                                tracing::info!(
-                                    "okx futures: unsubscribing {} removed instruments",
-                                    removed.len()
-                                );
-                                let mut unsub_args: Vec<serde_json::Value> = Vec::new();
-                                for inst_id in &removed {
-                                    unsub_args.push(serde_json::json!({
-                                        "channel": "tickers",
-                                        "instId": inst_id
-                                    }));
-                                    unsub_args.push(serde_json::json!({
-                                        "channel": "funding-rate",
-                                        "instId": inst_id
-                                    }));
-                                }
-                                for chunk in unsub_args.chunks(50) {
-                                    let unsub = serde_json::json!({
-                                        "op": "unsubscribe",
-                                        "args": chunk
-                                    });
-                                    if let Err(e) = write.send(Message::Text(unsub.to_string().into())).await {
-                                        tracing::error!("okx futures: unsub send error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Subscribe new instruments (both tickers + funding-rate)
-                            let added: Vec<String> = new_instruments
-                                .difference(&current_instruments)
-                                .cloned()
-                                .collect();
-                            if !added.is_empty() {
-                                tracing::info!(
-                                    "okx futures: subscribing {} new instruments",
-                                    added.len()
-                                );
-                                let mut sub_args: Vec<serde_json::Value> = Vec::new();
-                                for inst_id in &added {
-                                    sub_args.push(serde_json::json!({
-                                        "channel": "tickers",
-                                        "instId": inst_id
-                                    }));
-                                    sub_args.push(serde_json::json!({
-                                        "channel": "funding-rate",
-                                        "instId": inst_id
-                                    }));
-                                }
-                                for chunk in sub_args.chunks(50) {
-                                    let sub = serde_json::json!({
-                                        "op": "subscribe",
-                                        "args": chunk
-                                    });
-                                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                                        tracing::error!("okx futures: sub send error: {}", e);
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            }
-
-                            // Clean stale cache entries
-                            // Cache keys are normalized (e.g. "BTCUSDT") but instrument IDs
-                            // are OKX format (e.g. "BTC-USDT-SWAP"), so build valid normalized set
-                            {
-                                let valid_normalized: HashSet<String> = new_instruments
-                                    .iter()
-                                    .map(|id| normalize_swap(id))
-                                    .collect();
-                                let mut section = cache.okx_future.write().await;
-                                let before = section.items.len();
-                                section.items.retain(|k, _| valid_normalized.contains(k));
-                                let removed_count = before - section.items.len();
-                                if removed_count > 0 {
-                                    tracing::info!(
-                                        "okx futures: removed {} stale cache entries",
-                                        removed_count
-                                    );
-                                }
-                                section.serialize_cache();
-                            }
-
-                            current_instruments = new_instruments;
-                        }
                     }
                 }
-                } // else !subscribe_failed
             }
             Ok(Err(e)) => {
-                tracing::error!("okx futures: connection failed: {}", e);
+                tracing::error!("okx futures chunk-{}: connection failed: {}", chunk_id, e);
             }
             Err(_) => {
-                tracing::error!("okx futures: connection timed out");
+                tracing::error!("okx futures chunk-{}: connection timed out", chunk_id);
             }
         }
-        // Clear cache on disconnect to prevent stale data
-        cache.okx_future.write().await.clear();
+        // Don't clear cache — coordinator handles that
         backoff_sleep(attempt).await;
         attempt = attempt.saturating_add(1);
     }
