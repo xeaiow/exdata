@@ -400,7 +400,6 @@ async fn run_chunk(
                                     section.dirty = true;
                                     drop(section);
                                     let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                        exchange: crate::spread::ExchangeName::Okx,
                                         symbol: symbol_for_event,
                                     });
                                 }

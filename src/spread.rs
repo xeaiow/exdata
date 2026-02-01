@@ -15,15 +15,6 @@ pub enum ExchangeName {
     Zoomex,
 }
 
-pub const ALL_EXCHANGES: [ExchangeName; 6] = [
-    ExchangeName::Binance,
-    ExchangeName::Bybit,
-    ExchangeName::Okx,
-    ExchangeName::Gate,
-    ExchangeName::Bitget,
-    ExchangeName::Zoomex,
-];
-
 impl ExchangeName {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -41,7 +32,6 @@ impl ExchangeName {
 
 #[derive(Debug, Clone)]
 pub struct TickerChanged {
-    pub exchange: ExchangeName,
     pub symbol: String,
 }
 
