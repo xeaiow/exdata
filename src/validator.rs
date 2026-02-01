@@ -275,9 +275,10 @@ fn check_price_bps(
     }
     let bps = (own_val - bl_val) / bl_val * 10000.0;
     if bps.abs() > threshold {
+        let diff = own_val - bl_val;
         alerts.push(format!(
-            "{} {}: {} 價差 {:+.1} bps (門檻 {})",
-            exchange, symbol, field, bps, threshold
+            "{} {}: {} 價差 {:+.1} bps (門檻 {}) | exdata={} | baseline={} | diff={:+}",
+            exchange, symbol, field, bps, threshold, own_val, bl_val, diff
         ));
     }
 }
