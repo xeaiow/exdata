@@ -40,8 +40,6 @@ struct BaselineItem {
     a: f64,
     #[serde(default)]
     b: f64,
-    #[serde(rename = "trade24Count", default)]
-    trade24_count: f64,
     #[serde(rename = "rateInterval", default)]
     rate_interval: Option<u32>,
     #[serde(default)]
@@ -230,17 +228,6 @@ fn compare_item(
         }
     }
 
-    // trade24Count
-    if own.trade24_count > 0.0 && bl.trade24_count > 0.0 {
-        let pct = ((own.trade24_count - bl.trade24_count) / bl.trade24_count * 100.0).abs();
-        if pct > config.volume_threshold_pct {
-            alerts.push(format!(
-                "{} {}: trade24Count 差異 {:.1}% (門檻 {}%)",
-                exchange, symbol, pct, config.volume_threshold_pct
-            ));
-        }
-    }
-
     // rateInterval: exact match
     if own.rate_interval != bl.rate_interval {
         alerts.push(format!(
@@ -249,26 +236,28 @@ fn compare_item(
         ));
     }
 
-    // rate: exact string match
-    match (&own.rate, &bl.rate) {
-        (Some(ev), Some(bv)) if ev != bv => {
+    // rate: absolute-difference tolerance
+    if let (Some(ref ev), Some(ref bv)) = (&own.rate, &bl.rate) {
+        let e_val = parse_f64(ev);
+        let b_val = parse_f64(bv);
+        if (e_val - b_val).abs() > config.rate_threshold {
             alerts.push(format!(
-                "{} {}: rate 不一致 exdata={} baseline={}",
-                exchange, symbol, ev, bv
+                "{} {}: rate 不一致 exdata={} baseline={} (差 {:.4}, 門檻 {})",
+                exchange, symbol, ev, bv, (e_val - b_val).abs(), config.rate_threshold
             ));
         }
-        _ => {}
     }
 
-    // rateMax: exact string match
-    match (&own.rate_max, &bl.rate_max) {
-        (Some(ev), Some(bv)) if ev != bv => {
+    // rateMax: absolute-difference tolerance
+    if let (Some(ref ev), Some(ref bv)) = (&own.rate_max, &bl.rate_max) {
+        let e_val = parse_f64(ev);
+        let b_val = parse_f64(bv);
+        if (e_val - b_val).abs() > config.rate_threshold {
             alerts.push(format!(
-                "{} {}: rateMax 不一致 exdata={} baseline={}",
-                exchange, symbol, ev, bv
+                "{} {}: rateMax 不一致 exdata={} baseline={} (差 {:.4}, 門檻 {})",
+                exchange, symbol, ev, bv, (e_val - b_val).abs(), config.rate_threshold
             ));
         }
-        _ => {}
     }
 }
 

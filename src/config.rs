@@ -14,8 +14,8 @@ pub struct ValidatorConfig {
     pub interval_secs: u64,
     #[serde(default = "default_price_threshold")]
     pub price_threshold_bps: f64,
-    #[serde(default = "default_volume_threshold")]
-    pub volume_threshold_pct: f64,
+    #[serde(default = "default_rate_threshold")]
+    pub rate_threshold: f64,
 }
 
 fn default_interval() -> u64 {
@@ -24,8 +24,8 @@ fn default_interval() -> u64 {
 fn default_price_threshold() -> f64 {
     50.0
 }
-fn default_volume_threshold() -> f64 {
-    10.0
+fn default_rate_threshold() -> f64 {
+    0.01
 }
 
 /// Try to load config.toml. Returns None if file missing or [validator] section absent.
