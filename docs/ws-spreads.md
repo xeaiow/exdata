@@ -6,23 +6,31 @@ Real-time streaming of cross-exchange spread opportunities for perpetual futures
 
 ```
 ws://HOST:3000/ws/spreads
+ws://HOST:3000/ws/spreads?min_spread=0.1
 ```
 
 No authentication required.
 
+### Query Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `min_spread` | float | `0.0` | Minimum spread percentage threshold. Only pairs with `spread_percent >= min_spread` are pushed. `0` = push all non-negative spreads. |
+
 ## Protocol
 
 1. Client connects via standard WebSocket handshake.
-2. Server sends a **snapshot** message containing all current spread opportunities.
+2. Server sends a **snapshot** message containing all current spread opportunities that meet the `min_spread` threshold.
 3. Server streams **update** messages as spreads change in real-time.
-4. Server sends **ping** every 30 seconds. Client must respond with **pong** within 60 seconds or the connection is closed.
-5. If a client falls behind (slow consumer), the server re-sends a fresh snapshot.
+4. When a pair drops below the `min_spread` threshold, one final **update** is sent so the client can clean up, then that pair is no longer pushed until it returns above the threshold.
+5. Server sends **ping** every 30 seconds. Client must respond with **pong** within 60 seconds or the connection is closed.
+6. If a client falls behind (slow consumer), the server re-sends a fresh filtered snapshot.
 
 ## Message Types
 
 ### Snapshot
 
-Sent on initial connection and on lag recovery. Contains all spread opportunities where `spread_percent > 0`.
+Sent on initial connection and on lag recovery. Contains all spread opportunities where `spread_percent >= min_spread`.
 
 ```json
 {
@@ -68,6 +76,8 @@ Incremental update for a single spread pair.
 }
 ```
 
+An update with `spread_percent < min_spread` indicates the pair has crossed below the threshold. The client should remove it from tracking. No further updates will be sent for this pair until it returns above the threshold.
+
 ## Fields
 
 | Field | Type | Description |
@@ -102,17 +112,20 @@ Data is excluded when:
 ## Quick Test
 
 ```bash
-# websocat
+# websocat (all spreads)
 websocat ws://localhost:3000/ws/spreads
 
+# websocat (only spreads >= 0.1%)
+websocat 'ws://localhost:3000/ws/spreads?min_spread=0.1'
+
 # wscat
-wscat -c ws://localhost:3000/ws/spreads
+wscat -c 'ws://localhost:3000/ws/spreads?min_spread=0.1'
 
 # Python
 python3 -c "
 import asyncio, websockets, json
 async def main():
-    async with websockets.connect('ws://localhost:3000/ws/spreads') as ws:
+    async with websockets.connect('ws://localhost:3000/ws/spreads?min_spread=0.1') as ws:
         async for msg in ws:
             data = json.loads(msg)
             if data['type'] == 'snapshot':
