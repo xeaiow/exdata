@@ -121,6 +121,7 @@ async fn fetch_swap_instruments(client: &reqwest::Client) -> Vec<String> {
             i.state == "live"
                 && i.settle_ccy.as_deref() == Some("USDT")
                 && i.ct_type.as_deref() == Some("linear")
+                && normalize_swap(&i.inst_id) != "ALLUSDT"
         })
         .map(|i| i.inst_id)
         .collect()

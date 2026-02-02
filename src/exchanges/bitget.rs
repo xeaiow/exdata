@@ -154,7 +154,7 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> FuturesInstrumentD
     let mut funding_info: HashMap<String, (u32, String)> = HashMap::new();
 
     for contract in body.data {
-        if contract.status != "normal" {
+        if contract.status != "normal" || contract.symbol == "ALLUSDT" {
             continue;
         }
 

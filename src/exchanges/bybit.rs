@@ -150,7 +150,7 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
             let is_perp = info
                 .contract_type
                 .as_deref() == Some("LinearPerpetual");
-            if info.quote_coin == "USDT" && info.status == "Trading" && is_perp {
+            if info.quote_coin == "USDT" && info.status == "Trading" && is_perp && info.symbol != "ALLUSDT" {
                 symbols.push(info.symbol.clone());
                 let interval_hours = info.funding_interval.unwrap_or(480) / 60;
                 let rate_max = info

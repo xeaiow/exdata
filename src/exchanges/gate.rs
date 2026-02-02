@@ -103,7 +103,7 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
     let mut funding_info = HashMap::new();
 
     for c in contracts {
-        if c.in_delisting {
+        if c.in_delisting || normalize_symbol(&c.name) == "ALLUSDT" {
             continue;
         }
 

@@ -131,7 +131,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         // Build valid symbols from funding info keys (USDT only)
         let valid_symbols: Vec<String> = funding_info
             .keys()
-            .filter(|s| s.ends_with("USDT"))
+            .filter(|s| s.ends_with("USDT") && *s != "ALLUSDT")
             .cloned()
             .collect();
 
