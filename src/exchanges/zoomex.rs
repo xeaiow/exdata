@@ -353,13 +353,11 @@ async fn run_chunk(
                 tracing::info!("zoomex futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Subscribe in batches of 10
+                // Subscribe tickers in batches of 10
                 let mut subscribe_failed = false;
                 for chunk in symbols.chunks(10) {
-                    let mut args: Vec<String> =
+                    let args: Vec<String> =
                         chunk.iter().map(|s| format!("tickers.{}", s)).collect();
-                    // Also subscribe to orderbook.50 for depth data
-                    args.extend(chunk.iter().map(|s| format!("orderbook.50.{}", s)));
                     let sub = serde_json::json!({
                         "op": "subscribe",
                         "args": args
@@ -370,6 +368,23 @@ async fn run_chunk(
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                // Subscribe orderbook.50 in separate batches of 10
+                if !subscribe_failed {
+                    for chunk in symbols.chunks(10) {
+                        let args: Vec<String> =
+                            chunk.iter().map(|s| format!("orderbook.50.{}", s)).collect();
+                        let sub = serde_json::json!({
+                            "op": "subscribe",
+                            "args": args
+                        });
+                        if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                            tracing::error!("zoomex futures chunk-{}: orderbook subscribe send error: {}", chunk_id, e);
+                            subscribe_failed = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
 
                 if subscribe_failed {

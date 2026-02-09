@@ -287,25 +287,25 @@ async fn run_chunk(
                     }
                 }
 
-                // Subscribe to futures.order_book_update (depth=5, interval=1000ms)
+                // Subscribe to futures.order_book_update (one symbol per message)
                 if !subscribe_failed {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let mut payload: Vec<serde_json::Value> = symbols.iter().map(|s| serde_json::json!(s)).collect();
-                    payload.push(serde_json::json!("1000ms"));
-                    payload.push(serde_json::json!("5"));
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let sub = serde_json::json!({
-                        "time": now_secs,
-                        "channel": "futures.order_book_update",
-                        "event": "subscribe",
-                        "payload": payload
-                    });
-                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("gate futures chunk-{}: order_book_update subscribe send error: {}", chunk_id, e);
-                        subscribe_failed = true;
+                    for symbol in &symbols {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let sub = serde_json::json!({
+                            "time": now_secs,
+                            "channel": "futures.order_book_update",
+                            "event": "subscribe",
+                            "payload": [symbol, "100ms", "20"]
+                        });
+                        if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                            tracing::error!("gate futures chunk-{}: order_book_update subscribe send error: {}", chunk_id, e);
+                            subscribe_failed = true;
+                            break;
+                        }
                     }
                 }
 
