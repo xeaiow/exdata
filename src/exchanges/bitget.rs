@@ -1,6 +1,6 @@
 use crate::cache::SharedCache;
 use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
-use crate::models::ExchangeItem;
+use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -310,7 +310,7 @@ async fn run_chunk(
                 let (mut write, mut read) = ws.split();
 
                 // Subscribe all symbols in one batch (≤50)
-                let args: Vec<serde_json::Value> = symbols
+                let mut args: Vec<serde_json::Value> = symbols
                     .iter()
                     .map(|s| {
                         serde_json::json!({
@@ -320,6 +320,14 @@ async fn run_chunk(
                         })
                     })
                     .collect();
+                // Also subscribe to books5 for depth data
+                args.extend(symbols.iter().map(|s| {
+                    serde_json::json!({
+                        "instType": "USDT-FUTURES",
+                        "channel": "books5",
+                        "instId": s
+                    })
+                }));
                 let sub = serde_json::json!({
                     "op": "subscribe",
                     "args": args
@@ -388,14 +396,54 @@ async fn run_chunk(
                                 None => continue,
                             };
 
-                            if arg.channel != "ticker" {
-                                continue;
-                            }
-
                             let data = match ws_msg.data {
                                 Some(ref d) if !d.is_empty() => &d[0],
                                 _ => continue,
                             };
+
+                            if arg.channel == "books5" {
+                                let inst_id = data
+                                    .get("instId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&arg.inst_id);
+
+                                // Bitget books5 format: {"asks": [[price, qty], ...], "bids": ...}
+                                let parse_levels = |key: &str| -> Vec<PriceLevel> {
+                                    data.get(key)
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .take(5)
+                                                .filter_map(|entry| {
+                                                    let pair = entry.as_array()?;
+                                                    if pair.len() < 2 { return None; }
+                                                    Some(PriceLevel {
+                                                        price: parse_f64(pair[0].as_str().unwrap_or("0")),
+                                                        qty: parse_f64(pair[1].as_str().unwrap_or("0")),
+                                                    })
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                };
+
+                                let asks = parse_levels("asks");
+                                let bids = parse_levels("bids");
+
+                                if !asks.is_empty() || !bids.is_empty() {
+                                    let mut section = cache.bitget_future.write().await;
+                                    if let Some(item) = section.items.get_mut(inst_id) {
+                                        item.asks = asks;
+                                        item.bids = bids;
+                                    }
+                                    section.dirty = true;
+                                }
+                                continue;
+                            }
+
+                            if arg.channel != "ticker" {
+                                continue;
+                            }
 
                             let inst_id = data
                                 .get("instId")

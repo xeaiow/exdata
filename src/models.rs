@@ -1,6 +1,12 @@
 use serde::Serialize;
 use std::collections::HashMap;
 
+#[derive(Clone, Default, Serialize)]
+pub struct PriceLevel {
+    pub price: f64,
+    pub qty: f64,
+}
+
 /// Unified item for both Spot and Future data.
 /// Optional fields are skipped in JSON when None.
 #[derive(Clone, Default, Serialize)]
@@ -22,6 +28,10 @@ pub struct ExchangeItem {
     pub index_price: Option<String>,
     #[serde(rename = "markPrice", skip_serializing_if = "Option::is_none")]
     pub mark_price: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<PriceLevel>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bids: Vec<PriceLevel>,
 }
 
 /// Internal storage for one exchange section.

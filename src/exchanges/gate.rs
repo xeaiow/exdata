@@ -1,6 +1,6 @@
 use crate::cache::SharedCache;
 use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
-use crate::models::ExchangeItem;
+use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -287,6 +287,28 @@ async fn run_chunk(
                     }
                 }
 
+                // Subscribe to futures.order_book_update (depth=5, interval=1000ms)
+                if !subscribe_failed {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let mut payload: Vec<serde_json::Value> = symbols.iter().map(|s| serde_json::json!(s)).collect();
+                    payload.push(serde_json::json!("1000ms"));
+                    payload.push(serde_json::json!("5"));
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let sub = serde_json::json!({
+                        "time": now_secs,
+                        "channel": "futures.order_book_update",
+                        "event": "subscribe",
+                        "payload": payload
+                    });
+                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                        tracing::error!("gate futures chunk-{}: order_book_update subscribe send error: {}", chunk_id, e);
+                        subscribe_failed = true;
+                    }
+                }
+
                 if subscribe_failed {
                     tracing::warn!("gate futures chunk-{}: subscribe failed, reconnecting...", chunk_id);
                 } else {
@@ -502,6 +524,53 @@ async fn run_chunk(
                                     let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
                                         symbol: symbol_for_event,
                                     });
+                                }
+                                "futures.order_book_update" => {
+                                    let contract = result
+                                        .get("s")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if contract.is_empty() {
+                                        continue;
+                                    }
+
+                                    let normalized = normalize_symbol(contract);
+
+                                    // Gate format: {"p": "price", "s": "size"}
+                                    let parse_levels = |key: &str| -> Vec<PriceLevel> {
+                                        result.get(key)
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .take(5)
+                                                    .filter_map(|entry| {
+                                                        let o = entry.as_object()?;
+                                                        let price = o.get("p")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(parse_f64)
+                                                            .unwrap_or(0.0);
+                                                        let qty = o.get("s")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(parse_f64)
+                                                            .unwrap_or(0.0);
+                                                        Some(PriceLevel { price, qty })
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default()
+                                    };
+
+                                    let asks = parse_levels("a");
+                                    let bids = parse_levels("b");
+
+                                    if !asks.is_empty() || !bids.is_empty() {
+                                        let mut section = cache.gate_future.write().await;
+                                        if let Some(item) = section.items.get_mut(&normalized) {
+                                            item.asks = asks;
+                                            item.bids = bids;
+                                        }
+                                        section.dirty = true;
+                                    }
                                 }
                                 _ => {}
                             }

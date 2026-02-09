@@ -1,6 +1,6 @@
 use crate::cache::SharedCache;
 use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
-use crate::models::ExchangeItem;
+use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -212,11 +212,17 @@ async fn run_chunk(
             chunk_id,
             valid_set.len()
         );
-        let url =
-            "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker";
+        let depth_streams: Vec<String> = valid_set
+            .iter()
+            .map(|s| format!("{}@depth5@500ms", s.to_lowercase()))
+            .collect();
+        let url = format!(
+            "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker/{}",
+            depth_streams.join("/")
+        );
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            connect_async(url),
+            connect_async(&url),
         )
         .await;
         match ws_result {
@@ -371,6 +377,46 @@ async fn run_chunk(
                                     }
                                 }
                                 section.dirty = true;
+                            } else if stream.contains("@depth5") {
+                                // stream = "{symbol_lower}@depth5@500ms"
+                                let sym_upper = stream
+                                    .split('@')
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                if sym_upper.is_empty() || !valid_set.contains(&sym_upper) {
+                                    continue;
+                                }
+
+                                let bids_raw = combined.data.get("b")
+                                    .and_then(|v| v.as_array());
+                                let asks_raw = combined.data.get("a")
+                                    .and_then(|v| v.as_array());
+
+                                let parse_levels = |arr: &[serde_json::Value]| -> Vec<PriceLevel> {
+                                    arr.iter()
+                                        .take(5)
+                                        .filter_map(|entry| {
+                                            let pair = entry.as_array()?;
+                                            if pair.len() < 2 { return None; }
+                                            Some(PriceLevel {
+                                                price: parse_f64(pair[0].as_str().unwrap_or("0")),
+                                                qty: parse_f64(pair[1].as_str().unwrap_or("0")),
+                                            })
+                                        })
+                                        .collect()
+                                };
+
+                                let mut section = cache.binance_future.write().await;
+                                if let Some(item) = section.items.get_mut(&sym_upper) {
+                                    if let Some(b) = bids_raw {
+                                        item.bids = parse_levels(b);
+                                    }
+                                    if let Some(a) = asks_raw {
+                                        item.asks = parse_levels(a);
+                                    }
+                                    section.dirty = true;
+                                }
                             } else {
                                 tracing::warn!("binance futures chunk-{}: unknown stream: {}", chunk_id, stream);
                             }

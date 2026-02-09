@@ -1,6 +1,6 @@
 use crate::cache::SharedCache;
 use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
-use crate::models::ExchangeItem;
+use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -356,8 +356,10 @@ async fn run_chunk(
                 // Subscribe in batches of 10
                 let mut subscribe_failed = false;
                 for chunk in symbols.chunks(10) {
-                    let args: Vec<String> =
+                    let mut args: Vec<String> =
                         chunk.iter().map(|s| format!("tickers.{}", s)).collect();
+                    // Also subscribe to orderbook.50 for depth data
+                    args.extend(chunk.iter().map(|s| format!("orderbook.50.{}", s)));
                     let sub = serde_json::json!({
                         "op": "subscribe",
                         "args": args
@@ -423,14 +425,53 @@ async fn run_chunk(
                                 None => continue,
                             };
 
-                            if !topic.starts_with("tickers.") {
-                                continue;
-                            }
-
                             let data_val = match ws_msg.data {
                                 Some(v) => v,
                                 None => continue,
                             };
+
+                            if topic.starts_with("orderbook.50.") {
+                                let symbol = topic.strip_prefix("orderbook.50.").unwrap_or("").to_string();
+                                if symbol.is_empty() {
+                                    continue;
+                                }
+
+                                let parse_levels = |key: &str| -> Vec<PriceLevel> {
+                                    data_val.get(key)
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .take(5)
+                                                .filter_map(|entry| {
+                                                    let pair = entry.as_array()?;
+                                                    if pair.len() < 2 { return None; }
+                                                    Some(PriceLevel {
+                                                        price: parse_f64(pair[0].as_str().unwrap_or("0")),
+                                                        qty: parse_f64(pair[1].as_str().unwrap_or("0")),
+                                                    })
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                };
+
+                                let bids = parse_levels("b");
+                                let asks = parse_levels("a");
+
+                                if !bids.is_empty() || !asks.is_empty() {
+                                    let mut section = cache.zoomex_future.write().await;
+                                    if let Some(item) = section.items.get_mut(&symbol) {
+                                        item.bids = bids;
+                                        item.asks = asks;
+                                    }
+                                    section.dirty = true;
+                                }
+                                continue;
+                            }
+
+                            if !topic.starts_with("tickers.") {
+                                continue;
+                            }
 
                             let ticker: TickerData = match serde_json::from_value(data_val) {
                                 Ok(v) => v,

@@ -1,6 +1,6 @@
 use crate::cache::SharedCache;
 use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
-use crate::models::ExchangeItem;
+use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -246,7 +246,7 @@ async fn run_chunk(
                 tracing::info!("okx futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for tickers + funding-rate channels
+                // Build subscription args for tickers + funding-rate + books5 channels
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
                 for inst_id in &symbols {
                     all_args.push(serde_json::json!({
@@ -255,6 +255,10 @@ async fn run_chunk(
                     }));
                     all_args.push(serde_json::json!({
                         "channel": "funding-rate",
+                        "instId": inst_id
+                    }));
+                    all_args.push(serde_json::json!({
+                        "channel": "books5",
                         "instId": inst_id
                     }));
                 }
@@ -452,13 +456,46 @@ async fn run_chunk(
                                     }
                                     section.dirty = true;
                                 }
-                                _ => {
-                                    tracing::warn!(
-                                        "okx futures chunk-{}: unknown channel: {}",
-                                        chunk_id,
-                                        channel
-                                    );
+                                "books5" => {
+                                    let inst_id = data
+                                        .get("instId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&arg.inst_id);
+                                    let normalized = normalize_swap(inst_id);
+
+                                    // OKX books5 format: [[price, qty, _, num_orders], ...]
+                                    let parse_levels = |key: &str| -> Vec<PriceLevel> {
+                                        data.get(key)
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .take(5)
+                                                    .filter_map(|entry| {
+                                                        let pair = entry.as_array()?;
+                                                        if pair.len() < 2 { return None; }
+                                                        Some(PriceLevel {
+                                                            price: parse_f64(pair[0].as_str().unwrap_or("0")),
+                                                            qty: parse_f64(pair[1].as_str().unwrap_or("0")),
+                                                        })
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default()
+                                    };
+
+                                    let asks = parse_levels("asks");
+                                    let bids = parse_levels("bids");
+
+                                    if !asks.is_empty() || !bids.is_empty() {
+                                        let mut section = cache.okx_future.write().await;
+                                        if let Some(item) = section.items.get_mut(&normalized) {
+                                            item.asks = asks;
+                                            item.bids = bids;
+                                        }
+                                        section.dirty = true;
+                                    }
                                 }
+                                _ => {}
                             }
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {

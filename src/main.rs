@@ -3,6 +3,7 @@ mod cache;
 mod config;
 mod exchanges;
 mod models;
+mod recorder;
 mod validator;
 mod spread;
 mod ws;
@@ -31,6 +32,11 @@ async fn main() {
     // Spawn validator if configured
     if let Some(validator_config) = config::load_validator_config() {
         tokio::spawn(validator::run(cache.clone(), client.clone(), validator_config));
+    }
+
+    // Spawn recorder if configured
+    if let Some(recorder_config) = config::load_recorder_config() {
+        tokio::spawn(recorder::run_recorder(cache.clone(), recorder_config.clickhouse_url));
     }
 
     // Background serializer: periodically flushes dirty exchange sections to cached JSON.
