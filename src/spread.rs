@@ -117,6 +117,11 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
             let t1 = &tickers[i];
             let t2 = &tickers[j];
 
+            // Skip if cross-exchange timestamps differ by more than 5 seconds
+            if t1.ts.abs_diff(t2.ts) > 5_000 {
+                continue;
+            }
+
             // Skip if price ratio is too large (> 1.5x)
             let max_price = t1.ask.max(t1.bid).max(t2.ask).max(t2.bid);
             let min_price = t1.ask.min(t1.bid).min(t2.ask).min(t2.bid);
