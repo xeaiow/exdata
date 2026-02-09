@@ -287,7 +287,7 @@ async fn run_chunk(
                     }
                 }
 
-                // Subscribe to futures.order_book_update (one symbol per message)
+                // Subscribe to futures.order_book (snapshot, depth=5, one symbol per message)
                 if !subscribe_failed {
                     for symbol in &symbols {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -297,12 +297,12 @@ async fn run_chunk(
                             .as_secs();
                         let sub = serde_json::json!({
                             "time": now_secs,
-                            "channel": "futures.order_book_update",
+                            "channel": "futures.order_book",
                             "event": "subscribe",
-                            "payload": [symbol, "100ms", "20"]
+                            "payload": [symbol, "5", "0"]
                         });
                         if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                            tracing::error!("gate futures chunk-{}: order_book_update subscribe send error: {}", chunk_id, e);
+                            tracing::error!("gate futures chunk-{}: order_book subscribe send error: {}", chunk_id, e);
                             subscribe_failed = true;
                             break;
                         }
@@ -355,9 +355,9 @@ async fn run_chunk(
                                 }
                             };
 
-                            // Skip non-update messages (subscribe confirmations, etc.)
+                            // Skip non-data messages (subscribe confirmations, etc.)
                             match ws_msg.event.as_deref() {
-                                Some("update") => {}
+                                Some("update") | Some("all") => {}
                                 _ => continue,
                             }
 
@@ -525,9 +525,9 @@ async fn run_chunk(
                                         symbol: symbol_for_event,
                                     });
                                 }
-                                "futures.order_book_update" => {
+                                "futures.order_book" => {
                                     let contract = result
-                                        .get("s")
+                                        .get("contract")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     if contract.is_empty() {
@@ -536,7 +536,7 @@ async fn run_chunk(
 
                                     let normalized = normalize_symbol(contract);
 
-                                    // Gate format: {"p": "price", "s": "size"}
+                                    // Gate order_book format: {"asks": [{"p":"price","s":"size"},...], "bids": [...]}
                                     let parse_levels = |key: &str| -> Vec<PriceLevel> {
                                         result.get(key)
                                             .and_then(|v| v.as_array())
@@ -552,6 +552,7 @@ async fn run_chunk(
                                                         let qty = o.get("s")
                                                             .and_then(|v| v.as_str())
                                                             .map(parse_f64)
+                                                            .or_else(|| o.get("s").and_then(|v| v.as_f64()))
                                                             .unwrap_or(0.0);
                                                         Some(PriceLevel { price, qty })
                                                     })
@@ -560,8 +561,8 @@ async fn run_chunk(
                                             .unwrap_or_default()
                                     };
 
-                                    let asks = parse_levels("a");
-                                    let bids = parse_levels("b");
+                                    let asks = parse_levels("asks");
+                                    let bids = parse_levels("bids");
 
                                     if !asks.is_empty() || !bids.is_empty() {
                                         let mut section = cache.gate_future.write().await;

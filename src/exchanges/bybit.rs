@@ -45,6 +45,8 @@ struct WsMsg {
     ts: Option<u64>,
     #[serde(default)]
     op: Option<String>,
+    #[serde(rename = "type", default)]
+    msg_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -393,6 +395,10 @@ async fn run_chunk(
                             };
 
                             if topic.starts_with("orderbook.50.") {
+                                // Only process snapshot (ignore delta to avoid partial overwrites)
+                                if ws_msg.msg_type.as_deref() != Some("snapshot") {
+                                    continue;
+                                }
                                 // topic format: "orderbook.50.BTCUSDT"
                                 let symbol = topic.strip_prefix("orderbook.50.").unwrap_or("").to_string();
                                 if symbol.is_empty() {
