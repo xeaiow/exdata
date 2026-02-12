@@ -26,14 +26,3 @@ pub async fn backoff_sleep(attempt: u32) {
 pub fn parse_f64(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(0.0)
 }
-
-/// Parse a JSON value that may be either a string or a number into f64.
-pub fn json_f64(v: &serde_json::Value) -> f64 {
-    if let Some(s) = v.as_str() {
-        parse_f64(s)
-    } else if let Some(n) = v.as_f64() {
-        n
-    } else {
-        0.0
-    }
-}

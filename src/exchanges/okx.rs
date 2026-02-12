@@ -1,5 +1,5 @@
 use crate::cache::SharedCache;
-use crate::exchanges::{backoff_sleep, json_f64, now_ms, parse_f64};
+use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
 use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -474,8 +474,8 @@ async fn run_chunk(
                                                         let pair = entry.as_array()?;
                                                         if pair.len() < 2 { return None; }
                                                         Some(PriceLevel {
-                                                            price: json_f64(&pair[0]),
-                                                            qty: json_f64(&pair[1]),
+                                                            price: parse_f64(pair[0].as_str().unwrap_or("0")),
+                                                            qty: parse_f64(pair[1].as_str().unwrap_or("0")),
                                                         })
                                                     })
                                                     .collect()
