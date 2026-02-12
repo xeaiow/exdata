@@ -1,5 +1,5 @@
 use crate::cache::SharedCache;
-use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
+use crate::exchanges::{backoff_sleep, json_f64, now_ms, parse_f64};
 use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -450,32 +450,13 @@ async fn run_chunk(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(&arg.inst_id);
 
-                            let ask_pr = data
-                                .get("askPr")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
-                            let bid_pr = data
-                                .get("bidPr")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
-                            let quote_volume = data
-                                .get("quoteVolume")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
-                            let funding_rate = data
-                                .get("fundingRate")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
-                            let mark_price = data
-                                .get("markPrice")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
-                            let index_price = data
-                                .get("indexPrice")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
+                            let ask_pr = data.get("askPr").map(json_f64).unwrap_or(0.0);
+                            let bid_pr = data.get("bidPr").map(json_f64).unwrap_or(0.0);
+                            let quote_volume = data.get("quoteVolume").map(json_f64).unwrap_or(0.0);
+                            let rate_dec = data.get("fundingRate").map(json_f64).unwrap_or(0.0);
+                            let mark_price = data.get("markPrice").map(json_f64).unwrap_or(0.0);
+                            let index_price = data.get("indexPrice").map(json_f64).unwrap_or(0.0);
 
-                            let rate_dec = parse_f64(funding_rate);
                             let rate_str = format!("{:.3}", rate_dec * 100.0);
 
                             let ts = now_ms();
@@ -497,13 +478,13 @@ async fn run_chunk(
                                     ei
                                 });
 
-                            item.a = parse_f64(ask_pr);
-                            item.b = parse_f64(bid_pr);
+                            item.a = ask_pr;
+                            item.b = bid_pr;
                             item.ts = ts;
-                            item.trade24_count = parse_f64(quote_volume);
+                            item.trade24_count = quote_volume;
                             item.rate = Some(rate_str);
-                            item.mark_price = Some(mark_price.to_string());
-                            item.index_price = Some(index_price.to_string());
+                            item.mark_price = Some(format!("{}", mark_price));
+                            item.index_price = Some(format!("{}", index_price));
 
                             // Ensure funding info stays applied
                             if item.rate_interval.is_none() {

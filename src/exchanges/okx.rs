@@ -1,5 +1,5 @@
 use crate::cache::SharedCache;
-use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
+use crate::exchanges::{backoff_sleep, json_f64, now_ms, parse_f64};
 use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -374,18 +374,9 @@ async fn run_chunk(
                                     let normalized = normalize_swap(inst_id);
                                     let symbol_for_event = normalized.clone();
 
-                                    let ask_px = data
-                                        .get("askPx")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
-                                    let bid_px = data
-                                        .get("bidPx")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
-                                    let vol_ccy = data
-                                        .get("volCcy24h")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
+                                    let ask_px = data.get("askPx").map(json_f64).unwrap_or(0.0);
+                                    let bid_px = data.get("bidPx").map(json_f64).unwrap_or(0.0);
+                                    let vol_ccy = data.get("volCcy24h").map(json_f64).unwrap_or(0.0);
 
                                     let mut section = cache.okx_future.write().await;
                                     section.ts = ts;
@@ -398,10 +389,10 @@ async fn run_chunk(
                                             rate_max: Some("--".to_string()),
                                             ..Default::default()
                                         });
-                                    item.a = parse_f64(ask_px);
-                                    item.b = parse_f64(bid_px);
+                                    item.a = ask_px;
+                                    item.b = bid_px;
                                     item.ts = ts;
-                                    item.trade24_count = parse_f64(vol_ccy);
+                                    item.trade24_count = vol_ccy;
                                     section.dirty = true;
                                     drop(section);
                                     let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
@@ -415,24 +406,19 @@ async fn run_chunk(
                                         .unwrap_or(&arg.inst_id);
                                     let normalized = normalize_swap(inst_id);
 
-                                    let funding_rate = data
-                                        .get("fundingRate")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
-                                    let rate_dec = parse_f64(funding_rate);
+                                    let rate_dec = data.get("fundingRate").map(json_f64).unwrap_or(0.0);
                                     let rate_str = format!("{:.3}", rate_dec * 100.0);
 
                                     // Extract maxFundingRate
                                     let max_rate = data
                                         .get("maxFundingRate")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| format!("{:.3}", parse_f64(s) * 100.0))
+                                        .map(|v| format!("{:.3}", json_f64(v) * 100.0))
                                         .unwrap_or_else(|| "--".to_string());
 
                                     // Calculate interval from fundingTime and nextFundingTime
                                     let interval = {
-                                        let ft = data.get("fundingTime").and_then(|v| v.as_str()).map(|s| parse_f64(s) as u64).unwrap_or(0);
-                                        let nft = data.get("nextFundingTime").and_then(|v| v.as_str()).map(|s| parse_f64(s) as u64).unwrap_or(0);
+                                        let ft = data.get("fundingTime").map(|v| json_f64(v) as u64).unwrap_or(0);
+                                        let nft = data.get("nextFundingTime").map(|v| json_f64(v) as u64).unwrap_or(0);
                                         if nft > ft && ft > 0 {
                                             ((nft - ft) / 3_600_000) as u32
                                         } else {

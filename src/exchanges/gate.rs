@@ -1,5 +1,5 @@
 use crate::cache::SharedCache;
-use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
+use crate::exchanges::{backoff_sleep, json_f64, now_ms, parse_f64};
 use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -401,37 +401,20 @@ async fn run_chunk(
 
                                         let normalized = normalize_symbol(contract);
 
-                                        let volume_24h_quote = ticker
-                                            .get("volume_24h_quote")
-                                            .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "0")))
-                                            .unwrap_or("0");
-                                        let volume_val = if let Some(s) = ticker.get("volume_24h_quote") {
-                                            match s {
-                                                serde_json::Value::String(sv) => parse_f64(sv),
-                                                serde_json::Value::Number(n) => {
-                                                    n.as_f64().unwrap_or(0.0)
-                                                }
-                                                _ => parse_f64(volume_24h_quote),
-                                            }
-                                        } else {
-                                            0.0
-                                        };
+                                        let volume_val = ticker.get("volume_24h_quote")
+                                            .map(json_f64).unwrap_or(0.0);
 
-                                        let funding_rate = ticker
-                                            .get("funding_rate")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("0");
-                                        let mark_price = ticker
-                                            .get("mark_price")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("0");
-                                        let index_price = ticker
-                                            .get("index_price")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("0");
-
-                                        let rate_dec = parse_f64(funding_rate);
+                                        let rate_dec = ticker.get("funding_rate")
+                                            .map(json_f64).unwrap_or(0.0);
                                         let rate_str = format!("{:.3}", rate_dec * 100.0);
+                                        let mark_price_str = ticker.get("mark_price")
+                                            .and_then(|v| v.as_str().map(|s| s.to_string())
+                                                .or_else(|| v.as_f64().map(|n| format!("{}", n))))
+                                            .unwrap_or_default();
+                                        let index_price_str = ticker.get("index_price")
+                                            .and_then(|v| v.as_str().map(|s| s.to_string())
+                                                .or_else(|| v.as_f64().map(|n| format!("{}", n))))
+                                            .unwrap_or_default();
 
                                         let item = section
                                             .items
@@ -452,8 +435,12 @@ async fn run_chunk(
 
                                         item.trade24_count = volume_val;
                                         item.rate = Some(rate_str);
-                                        item.mark_price = Some(mark_price.to_string());
-                                        item.index_price = Some(index_price.to_string());
+                                        if !mark_price_str.is_empty() {
+                                            item.mark_price = Some(mark_price_str);
+                                        }
+                                        if !index_price_str.is_empty() {
+                                            item.index_price = Some(index_price_str);
+                                        }
 
                                         if item.rate_interval.is_none() {
                                             if let Some((interval, max_rate)) =
@@ -480,12 +467,12 @@ async fn run_chunk(
 
                                     let ask = result
                                         .get("a")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
+                                        .map(json_f64)
+                                        .unwrap_or(0.0);
                                     let bid = result
                                         .get("b")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("0");
+                                        .map(json_f64)
+                                        .unwrap_or(0.0);
 
                                     let mut section = cache.gate_future.write().await;
                                     section.ts = ts;
@@ -507,8 +494,8 @@ async fn run_chunk(
                                             ei
                                         });
 
-                                    item.a = parse_f64(ask);
-                                    item.b = parse_f64(bid);
+                                    item.a = ask;
+                                    item.b = bid;
                                     item.ts = ts;
 
                                     if item.rate_interval.is_none() {
