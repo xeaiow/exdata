@@ -1,5 +1,5 @@
 use crate::cache::SharedCache;
-use crate::exchanges::{backoff_sleep, now_ms, parse_f64};
+use crate::exchanges::{backoff_sleep, json_f64, now_ms, parse_f64};
 use crate::models::{ExchangeItem, PriceLevel};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -536,7 +536,7 @@ async fn run_chunk(
 
                                     let normalized = normalize_symbol(contract);
 
-                                    // Gate order_book format: {"asks": [{"p":"price","s":"size"},...], "bids": [...]}
+                                    // Gate order_book format: {"asks": [{"p":"price","s":size},...], "bids": [...]}
                                     let parse_levels = |key: &str| -> Vec<PriceLevel> {
                                         result.get(key)
                                             .and_then(|v| v.as_array())
@@ -545,15 +545,8 @@ async fn run_chunk(
                                                     .take(5)
                                                     .filter_map(|entry| {
                                                         let o = entry.as_object()?;
-                                                        let price = o.get("p")
-                                                            .and_then(|v| v.as_str())
-                                                            .map(parse_f64)
-                                                            .unwrap_or(0.0);
-                                                        let qty = o.get("s")
-                                                            .and_then(|v| v.as_str())
-                                                            .map(parse_f64)
-                                                            .or_else(|| o.get("s").and_then(|v| v.as_f64()))
-                                                            .unwrap_or(0.0);
+                                                        let price = o.get("p").map(json_f64).unwrap_or(0.0);
+                                                        let qty = o.get("s").map(json_f64).unwrap_or(0.0);
                                                         Some(PriceLevel { price, qty })
                                                     })
                                                     .collect()
