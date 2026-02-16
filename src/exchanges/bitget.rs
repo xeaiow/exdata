@@ -80,9 +80,10 @@ async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<SpotTickerItem> 
     body.data
 }
 
-/// Fetch max funding rates from the current-fund-rate endpoint.
-/// Returns symbol -> maxFundingRate (as percentage string, e.g. "0.300").
-async fn fetch_max_funding_rates(client: &reqwest::Client) -> HashMap<String, String> {
+/// Fetch funding info from the current-fund-rate endpoint.
+/// Returns symbol -> (interval_hours, rate_max_pct).
+/// This endpoint provides both interval and max rate, superseding contract-level funding data.
+async fn fetch_funding_rates_info(client: &reqwest::Client) -> HashMap<String, (u32, String)> {
     #[derive(Deserialize)]
     struct FundRateResponse {
         data: Vec<FundRateItem>,
@@ -90,6 +91,8 @@ async fn fetch_max_funding_rates(client: &reqwest::Client) -> HashMap<String, St
     #[derive(Deserialize)]
     struct FundRateItem {
         symbol: String,
+        #[serde(rename = "fundingRateInterval", default)]
+        funding_rate_interval: Option<String>,
         #[serde(rename = "maxFundingRate", default)]
         max_funding_rate: Option<String>,
     }
@@ -111,10 +114,17 @@ async fn fetch_max_funding_rates(client: &reqwest::Client) -> HashMap<String, St
     };
     let mut map = HashMap::with_capacity(body.data.len());
     for item in body.data {
-        if let Some(ref max_rate) = item.max_funding_rate {
-            let v = parse_f64(max_rate);
-            map.insert(item.symbol, format!("{:.3}", v * 100.0));
-        }
+        let interval: u32 = item
+            .funding_rate_interval
+            .as_deref()
+            .unwrap_or("8")
+            .parse()
+            .unwrap_or(8);
+        let max_rate = match item.max_funding_rate {
+            Some(ref v) => format!("{:.3}", parse_f64(v) * 100.0),
+            None => "--".to_string(),
+        };
+        map.insert(item.symbol, (interval, max_rate));
     }
     map
 }
@@ -199,12 +209,13 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         }
         attempt = 0;
 
-        // Fetch max funding rates and merge into funding_info
-        let max_rates = fetch_max_funding_rates(&client).await;
-        if !max_rates.is_empty() {
-            tracing::info!("bitget futures: loaded max funding rates for {} symbols", max_rates.len());
-            for (sym, max_rate) in &max_rates {
+        // Fetch funding info (interval + max rate) and merge into funding_info
+        let fund_info = fetch_funding_rates_info(&client).await;
+        if !fund_info.is_empty() {
+            tracing::info!("bitget futures: loaded funding info for {} symbols", fund_info.len());
+            for (sym, (interval, max_rate)) in &fund_info {
                 if let Some(info) = instr.funding_info.get_mut(sym) {
+                    info.0 = *interval;
                     info.1 = max_rate.clone();
                 }
             }

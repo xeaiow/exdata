@@ -228,12 +228,14 @@ fn compare_item(
         }
     }
 
-    // rateInterval: exact match
-    if own.rate_interval != bl.rate_interval {
-        alerts.push(format!(
-            "{} {}: rateInterval 不一致 exdata={:?} baseline={:?}",
-            exchange, symbol, own.rate_interval, bl.rate_interval
-        ));
+    // rateInterval: exact match (skip if either side is None)
+    if let (Some(ei), Some(bi)) = (own.rate_interval, bl.rate_interval) {
+        if ei != bi {
+            alerts.push(format!(
+                "{} {}: rateInterval 不一致 exdata={} baseline={}",
+                exchange, symbol, ei, bi
+            ));
+        }
     }
 
     // rate: absolute-difference tolerance

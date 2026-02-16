@@ -165,8 +165,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                     .entry(normalized.clone())
                     .or_insert_with(|| ExchangeItem {
                         name: normalized,
-                        rate_interval: Some(0),
-                        rate_max: Some("--".to_string()),
                         ..Default::default()
                     });
                 item.a = parse_f64(&t.ask_px);
@@ -385,8 +383,6 @@ async fn run_chunk(
                                         .entry(normalized.clone())
                                         .or_insert_with(|| ExchangeItem {
                                             name: normalized,
-                                            rate_interval: Some(0),
-                                            rate_max: Some("--".to_string()),
                                             ..Default::default()
                                         });
                                     item.a = ask_px;
