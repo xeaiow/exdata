@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS ticker_snapshots (
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (exchange, symbol, ts)
-TTL toDateTime(ts) + INTERVAL 30 DAY DELETE
+TTL toDateTime(ts) + INTERVAL 7 DAY DELETE
 SETTINGS index_granularity = 8192
 ";
 
