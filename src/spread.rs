@@ -90,7 +90,7 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
     for (exchange, lock) in &sections {
         let section = lock.read().await;
         if let Some(item) = section.items.get(symbol) {
-            if item.ts == 0 || now.saturating_sub(item.ts) > 10_000 {
+            if item.ts == 0 || now.saturating_sub(item.ts) > 60_000 {
                 continue;
             }
             if item.a <= 0.0 || item.b <= 0.0 {
