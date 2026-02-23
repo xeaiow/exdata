@@ -36,7 +36,12 @@ async fn main() {
 
     // Spawn recorder if configured
     if let Some(recorder_config) = config::load_recorder_config() {
-        tokio::spawn(recorder::run_recorder(cache.clone(), recorder_config.clickhouse_url));
+        tokio::spawn(recorder::run_recorder(
+            cache.clone(),
+            recorder_config.clickhouse_url,
+            recorder_config.clickhouse_user,
+            recorder_config.clickhouse_password,
+        ));
     }
 
     // Background serializer: periodically flushes dirty exchange sections to cached JSON.

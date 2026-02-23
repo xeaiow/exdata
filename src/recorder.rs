@@ -49,9 +49,11 @@ fn parse_opt_f64(s: &Option<String>) -> Option<f64> {
     s.as_ref().and_then(|v| v.parse::<f64>().ok())
 }
 
-pub async fn run_recorder(cache: SharedCache, clickhouse_url: String) {
+pub async fn run_recorder(cache: SharedCache, clickhouse_url: String, clickhouse_user: String, clickhouse_password: String) {
     let ch = Client::default()
         .with_url(&clickhouse_url)
+        .with_user(&clickhouse_user)
+        .with_password(&clickhouse_password)
         .with_option("async_insert", "1")
         .with_option("wait_for_async_insert", "0");
 

@@ -25,10 +25,18 @@ pub struct RecorderConfig {
     pub enabled: bool,
     #[serde(default = "default_clickhouse_url")]
     pub clickhouse_url: String,
+    #[serde(default = "default_clickhouse_user")]
+    pub clickhouse_user: String,
+    #[serde(default)]
+    pub clickhouse_password: String,
 }
 
 fn default_clickhouse_url() -> String {
     "http://localhost:8123".to_string()
+}
+
+fn default_clickhouse_user() -> String {
+    "default".to_string()
 }
 
 fn default_interval() -> u64 {
