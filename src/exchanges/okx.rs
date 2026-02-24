@@ -451,7 +451,7 @@ async fn run_chunk(
                                             .and_then(|v| v.as_array())
                                             .map(|arr| {
                                                 arr.iter()
-                                                    .take(5)
+                                                    .take(20)
                                                     .filter_map(|entry| {
                                                         let pair = entry.as_array()?;
                                                         if pair.len() < 2 { return None; }

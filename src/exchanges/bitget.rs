@@ -331,11 +331,11 @@ async fn run_chunk(
                         })
                     })
                     .collect();
-                // Also subscribe to books5 for depth data
+                // Also subscribe to books15 for depth data
                 args.extend(symbols.iter().map(|s| {
                     serde_json::json!({
                         "instType": "USDT-FUTURES",
-                        "channel": "books5",
+                        "channel": "books15",
                         "instId": s
                     })
                 }));
@@ -412,19 +412,19 @@ async fn run_chunk(
                                 _ => continue,
                             };
 
-                            if arg.channel == "books5" {
+                            if arg.channel == "books15" || arg.channel == "books5" {
                                 let inst_id = data
                                     .get("instId")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or(&arg.inst_id);
 
-                                // Bitget books5 format: {"asks": [[price, qty], ...], "bids": ...}
+                                // Bitget books format: {"asks": [[price, qty], ...], "bids": ...}
                                 let parse_levels = |key: &str| -> Vec<PriceLevel> {
                                     data.get(key)
                                         .and_then(|v| v.as_array())
                                         .map(|arr| {
                                             arr.iter()
-                                                .take(5)
+                                                .take(20)
                                                 .filter_map(|entry| {
                                                     let pair = entry.as_array()?;
                                                     if pair.len() < 2 { return None; }

@@ -214,7 +214,7 @@ async fn run_chunk(
         );
         let depth_streams: Vec<String> = valid_set
             .iter()
-            .map(|s| format!("{}@depth5@500ms", s.to_lowercase()))
+            .map(|s| format!("{}@depth20@500ms", s.to_lowercase()))
             .collect();
         let url = format!(
             "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker/{}",
@@ -377,8 +377,8 @@ async fn run_chunk(
                                     }
                                 }
                                 section.dirty = true;
-                            } else if stream.contains("@depth5") {
-                                // stream = "{symbol_lower}@depth5@500ms"
+                            } else if stream.contains("@depth20") {
+                                // stream = "{symbol_lower}@depth20@500ms"
                                 let sym_upper = stream
                                     .split('@')
                                     .next()
@@ -395,7 +395,7 @@ async fn run_chunk(
 
                                 let parse_levels = |arr: &[serde_json::Value]| -> Vec<PriceLevel> {
                                     arr.iter()
-                                        .take(5)
+                                        .take(20)
                                         .filter_map(|entry| {
                                             let pair = entry.as_array()?;
                                             if pair.len() < 2 { return None; }

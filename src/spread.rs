@@ -1,5 +1,6 @@
 use crate::cache::SharedCache;
 use crate::exchanges::now_ms;
+use crate::models::PriceLevel;
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -52,6 +53,10 @@ pub struct SpreadOpportunity {
     pub short_ask: f64,
     pub spread_percent: f64,
     pub volume_24h: Volume24h,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub long_asks: Vec<PriceLevel>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub short_bids: Vec<PriceLevel>,
     pub ts: u64,
 }
 
@@ -70,6 +75,8 @@ pub struct SymbolTicker {
     pub bid: f64,
     pub ts: u64,
     pub volume_24h: f64,
+    pub asks: Vec<crate::models::PriceLevel>,
+    pub bids: Vec<crate::models::PriceLevel>,
 }
 
 // ── Read tickers from cache ─────────────────────────────────────────────────
@@ -102,6 +109,8 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
                 bid: item.b,
                 ts: item.ts,
                 volume_24h: item.trade24_count,
+                asks: item.asks.clone(),
+                bids: item.bids.clone(),
             });
         }
     }
@@ -174,6 +183,8 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                     long: long.volume_24h,
                     short: short.volume_24h,
                 },
+                long_asks: long.asks.clone(),
+                short_bids: short.bids.clone(),
                 ts,
             });
         }

@@ -287,7 +287,7 @@ async fn run_chunk(
                     }
                 }
 
-                // Subscribe to futures.order_book (snapshot, depth=5, one symbol per message)
+                // Subscribe to futures.order_book (snapshot, depth=20, one symbol per message)
                 if !subscribe_failed {
                     for symbol in &symbols {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -299,7 +299,7 @@ async fn run_chunk(
                             "time": now_secs,
                             "channel": "futures.order_book",
                             "event": "subscribe",
-                            "payload": [symbol, "5", "0"]
+                            "payload": [symbol, "20", "0"]
                         });
                         if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
                             tracing::error!("gate futures chunk-{}: order_book subscribe send error: {}", chunk_id, e);
@@ -529,7 +529,7 @@ async fn run_chunk(
                                             .and_then(|v| v.as_array())
                                             .map(|arr| {
                                                 arr.iter()
-                                                    .take(5)
+                                                    .take(20)
                                                     .filter_map(|entry| {
                                                         let o = entry.as_object()?;
                                                         let price = o.get("p")
