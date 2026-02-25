@@ -217,9 +217,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         for h in handles {
             let _ = h.await;
         }
-
-        // Clear cache before full restart
-        cache.gate_future.write().await.clear();
     }
 }
 

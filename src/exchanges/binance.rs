@@ -189,9 +189,6 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         tracing::info!("binance futures: coordinator restarting, aborting worker");
         handle.abort();
         let _ = handle.await;
-
-        // Clear cache before full restart
-        cache.binance_future.write().await.clear();
     }
 }
 
