@@ -87,7 +87,7 @@ pub async fn run_recorder(cache: SharedCache, clickhouse_url: String, clickhouse
             let section = lock.read().await;
             for item in section.items.values() {
                 // Skip stale or invalid items
-                if item.ts == 0 || now.saturating_sub(item.ts) > 60_000 {
+                if item.ts == 0 || now.saturating_sub(item.ts) > 10_000 {
                     continue;
                 }
                 if item.a <= 0.0 || item.b <= 0.0 {
