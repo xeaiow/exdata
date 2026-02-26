@@ -236,6 +236,7 @@ async fn run_chunk(
 
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut depth_throttle: std::collections::HashMap<String, tokio::time::Instant> = std::collections::HashMap::new();
 
                 loop {
                     tokio::select! {
@@ -404,15 +405,29 @@ async fn run_chunk(
                                         .collect()
                                 };
 
-                                let mut section = cache.binance_future.write().await;
-                                if let Some(item) = section.items.get_mut(&sym_upper) {
-                                    if let Some(b) = bids_raw {
-                                        item.bids = parse_levels(b);
+                                let mut updated = false;
+                                {
+                                    let mut section = cache.binance_future.write().await;
+                                    if let Some(item) = section.items.get_mut(&sym_upper) {
+                                        if let Some(b) = bids_raw {
+                                            item.bids = parse_levels(b);
+                                        }
+                                        if let Some(a) = asks_raw {
+                                            item.asks = parse_levels(a);
+                                        }
+                                        item.depth_ts = ts;
+                                        section.dirty = true;
+                                        updated = true;
                                     }
-                                    if let Some(a) = asks_raw {
-                                        item.asks = parse_levels(a);
+                                }
+                                if updated {
+                                    let now_inst = tokio::time::Instant::now();
+                                    let should_fire = depth_throttle.get(&sym_upper)
+                                        .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));
+                                    if should_fire {
+                                        depth_throttle.insert(sym_upper.clone(), now_inst);
+                                        let _ = cache.ticker_tx.send(crate::spread::TickerChanged { symbol: sym_upper.clone() });
                                     }
-                                    section.dirty = true;
                                 }
                             } else {
                                 tracing::warn!("binance futures chunk-{}: unknown stream: {}", chunk_id, stream);

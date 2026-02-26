@@ -58,6 +58,12 @@ pub struct SpreadOpportunity {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub short_bids: Vec<PriceLevel>,
     pub ts: u64,
+    #[serde(rename = "depthTs", skip_serializing_if = "is_zero_u64")]
+    pub depth_ts: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize)]
@@ -74,6 +80,7 @@ pub struct SymbolTicker {
     pub ask: f64,
     pub bid: f64,
     pub ts: u64,
+    pub depth_ts: u64,
     pub volume_24h: f64,
     pub asks: Vec<crate::models::PriceLevel>,
     pub bids: Vec<crate::models::PriceLevel>,
@@ -108,6 +115,7 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
                 ask: item.a,
                 bid: item.b,
                 ts: item.ts,
+                depth_ts: item.depth_ts,
                 volume_24h: item.trade24_count,
                 asks: item.asks.clone(),
                 bids: item.bids.clone(),
@@ -170,6 +178,13 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
             let spread_rounded = (spread_pct * 100.0).round() / 100.0;
             let ts = long.ts.max(short.ts);
 
+            // Use the older depth_ts (conservative: if either is 0, result is 0)
+            let depth_ts = if long.depth_ts == 0 || short.depth_ts == 0 {
+                0
+            } else {
+                long.depth_ts.min(short.depth_ts)
+            };
+
             results.push(SpreadOpportunity {
                 symbol: symbol.to_string(),
                 long_exchange: long.exchange.as_str(),
@@ -186,6 +201,7 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                 long_asks: long.asks.clone(),
                 short_bids: short.bids.clone(),
                 ts,
+                depth_ts,
             });
         }
     }

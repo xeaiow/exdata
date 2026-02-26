@@ -394,6 +394,7 @@ async fn run_chunk(
                 ping_interval.tick().await; // consume the immediate first tick
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut depth_throttle: std::collections::HashMap<String, tokio::time::Instant> = std::collections::HashMap::new();
 
                 loop {
                     tokio::select! {
@@ -477,12 +478,26 @@ async fn run_chunk(
                                 let asks = parse_levels("a");
 
                                 if !bids.is_empty() || !asks.is_empty() {
-                                    let mut section = cache.zoomex_future.write().await;
-                                    if let Some(item) = section.items.get_mut(&symbol) {
-                                        item.bids = bids;
-                                        item.asks = asks;
+                                    let mut updated = false;
+                                    {
+                                        let mut section = cache.zoomex_future.write().await;
+                                        if let Some(item) = section.items.get_mut(&symbol) {
+                                            item.bids = bids;
+                                            item.asks = asks;
+                                            item.depth_ts = now_ms();
+                                            section.dirty = true;
+                                            updated = true;
+                                        }
                                     }
-                                    section.dirty = true;
+                                    if updated {
+                                        let now_inst = tokio::time::Instant::now();
+                                        let should_fire = depth_throttle.get(&symbol)
+                                            .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));
+                                        if should_fire {
+                                            depth_throttle.insert(symbol.clone(), now_inst);
+                                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged { symbol: symbol.clone() });
+                                        }
+                                    }
                                 }
                                 continue;
                             }
