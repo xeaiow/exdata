@@ -190,6 +190,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             );
             section.serialize_cache();
         }
+        cache.binance_future.write().await.restarting = false;
 
         // Spawn single chunk worker (Binance uses array broadcast, no per-symbol sub)
         let funding_info = std::sync::Arc::new(funding_info);
@@ -211,6 +212,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
         tracing::info!("binance futures: coordinator restarting, aborting worker");
+        cache.binance_future.write().await.restarting = true;
         refresher_handle.abort();
         let _ = refresher_handle.await;
         handle.abort();

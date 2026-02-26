@@ -206,6 +206,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             );
             section.serialize_cache();
         }
+        cache.gate_future.write().await.restarting = false;
 
         // Split symbols into chunks of 50 and spawn a worker for each
         let funding_info = std::sync::Arc::new(contract_info.funding_info);
@@ -236,6 +237,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
         tracing::info!("gate futures: coordinator restarting, aborting {} chunks", handles.len());
+        cache.gate_future.write().await.restarting = true;
         refresher_handle.abort();
         let _ = refresher_handle.await;
         for h in &handles {

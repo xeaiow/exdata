@@ -178,6 +178,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             );
             section.serialize_cache();
         }
+        cache.okx_future.write().await.restarting = false;
 
         // Split instruments into chunks of 50 and spawn a worker for each
         let chunks: Vec<Vec<String>> = instruments
@@ -205,6 +206,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             "okx futures: coordinator restarting, aborting {} chunks",
             handles.len()
         );
+        cache.okx_future.write().await.restarting = true;
         for h in &handles {
             h.abort();
         }

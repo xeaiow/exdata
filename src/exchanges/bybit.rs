@@ -261,6 +261,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             );
             section.serialize_cache();
         }
+        cache.bybit_future.write().await.restarting = false;
 
         // Split symbols into chunks of 50 and spawn a worker for each
         let funding_info = std::sync::Arc::new(instr.funding_info);
@@ -291,6 +292,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
         tracing::info!("bybit futures: coordinator restarting, aborting {} chunks", handles.len());
+        cache.bybit_future.write().await.restarting = true;
         refresher_handle.abort();
         let _ = refresher_handle.await;
         for h in &handles {

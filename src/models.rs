@@ -49,6 +49,9 @@ pub struct ExchangeSection {
     pub cached_json: String,
     /// Whether items have been modified since the last serialize_cache() call.
     pub dirty: bool,
+    /// Set to true while the coordinator is restarting (aborting workers → re-seeding).
+    /// Validator skips this section when true to avoid false disconnect alerts.
+    pub restarting: bool,
 }
 
 impl ExchangeSection {
@@ -58,6 +61,7 @@ impl ExchangeSection {
             items: HashMap::new(),
             cached_json: String::new(),
             dirty: false,
+            restarting: true,
         };
         s.serialize_cache();
         s
