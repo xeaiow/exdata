@@ -9,13 +9,54 @@ anomalous symbols using a Modified Z-Score method.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+from pathlib import Path
+from urllib.parse import urlparse
 
 import clickhouse_connect
 import pandas as pd
 from scipy.stats import median_abs_deviation
 from tabulate import tabulate
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+# Try to import tomllib (3.11+) or tomli as fallback
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
+
+# Resolve project root relative to this script (scripts/ -> project root)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_PATH = _PROJECT_ROOT / "config.toml"
+
+
+def _load_config_defaults() -> dict[str, str]:
+    """Read ClickHouse connection info from config.toml [recorder] section."""
+    if tomllib is None or not _CONFIG_PATH.exists():
+        return {}
+    with open(_CONFIG_PATH, "rb") as f:
+        cfg = tomllib.load(f)
+    recorder = cfg.get("recorder", {})
+    result: dict[str, str] = {}
+    # Parse clickhouse_url like "http://admin:pass@host:8123"
+    raw_url = recorder.get("clickhouse_url", "")
+    if raw_url:
+        parsed = urlparse(raw_url)
+        if parsed.hostname:
+            result["host"] = parsed.hostname
+        if parsed.port:
+            result["port"] = str(parsed.port)
+    if recorder.get("clickhouse_user"):
+        result["user"] = recorder["clickhouse_user"]
+    if recorder.get("clickhouse_password"):
+        result["password"] = recorder["clickhouse_password"]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +64,7 @@ from tabulate import tabulate
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    defaults = _load_config_defaults()
     parser = argparse.ArgumentParser(
         description="Detect abnormal cross-exchange cryptocurrency spreads",
     )
@@ -47,26 +89,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clickhouse-url",
         type=str,
-        default="localhost",
-        help="ClickHouse host (default: localhost)",
+        default=defaults.get("host", "localhost"),
+        help="ClickHouse host (default: from config.toml)",
     )
     parser.add_argument(
         "--clickhouse-port",
         type=int,
-        default=8123,
-        help="ClickHouse HTTP port (default: 8123)",
+        default=int(defaults.get("port", "8123")),
+        help="ClickHouse HTTP port (default: from config.toml)",
     )
     parser.add_argument(
         "--clickhouse-user",
         type=str,
-        default="admin",
-        help="ClickHouse user (default: admin)",
+        default=defaults.get("user", "admin"),
+        help="ClickHouse user (default: from config.toml)",
     )
     parser.add_argument(
         "--clickhouse-password",
         type=str,
-        default=os.environ.get("CLICKHOUSE_PASSWORD", ""),
-        help="ClickHouse password (default: $CLICKHOUSE_PASSWORD)",
+        default=defaults.get("password", ""),
+        help="ClickHouse password (default: from config.toml)",
     )
     return parser.parse_args()
 
@@ -82,8 +124,8 @@ def load_data(client, hours: int) -> pd.DataFrame:
         "  toStartOfMinute(ts) AS minute, "
         "  symbol, "
         "  exchange, "
-        "  avg(bid) AS bid, "
-        "  avg(ask) AS ask "
+        "  avg(bid) AS avg_bid, "
+        "  avg(ask) AS avg_ask "
         "FROM ticker_snapshots "
         f"WHERE ts >= now() - INTERVAL {hours} HOUR "
         "  AND bid > 0 AND ask > 0 "
@@ -93,7 +135,7 @@ def load_data(client, hours: int) -> pd.DataFrame:
     result = client.query(query)
     df = pd.DataFrame(
         result.result_rows,
-        columns=["minute", "symbol", "exchange", "bid", "ask"],
+        columns=["minute", "symbol", "exchange", "avg_bid", "avg_ask"],
     )
     return df
 
@@ -119,13 +161,14 @@ def compute_spreads(df: pd.DataFrame) -> pd.DataFrame:
 
     # Midpoint of all four price legs
     midpoint = (
-        merged["bid_a"] + merged["ask_a"] + merged["bid_b"] + merged["ask_b"]
+        merged["avg_bid_a"] + merged["avg_ask_a"]
+        + merged["avg_bid_b"] + merged["avg_ask_b"]
     ) / 4.0
 
     # Direction 1: long A (buy at A.ask), short B (sell at B.bid)
-    spread1 = (merged["bid_b"] - merged["ask_a"]) / midpoint * 100.0
+    spread1 = (merged["avg_bid_b"] - merged["avg_ask_a"]) / midpoint * 100.0
     # Direction 2: long B (buy at B.ask), short A (sell at A.bid)
-    spread2 = (merged["bid_a"] - merged["ask_b"]) / midpoint * 100.0
+    spread2 = (merged["avg_bid_a"] - merged["avg_ask_b"]) / midpoint * 100.0
 
     # Best direction
     merged["spread_pct"] = pd.concat([spread1, spread2], axis=1).max(axis=1)
@@ -137,8 +180,8 @@ def compute_spreads(df: pd.DataFrame) -> pd.DataFrame:
 
     # Sanity filters: price ratio <= 1.5x, |spread| <= 20%
     price_ratio = (
-        merged[["ask_a", "ask_b"]].max(axis=1)
-        / merged[["ask_a", "ask_b"]].min(axis=1)
+        merged[["avg_ask_a", "avg_ask_b"]].max(axis=1)
+        / merged[["avg_ask_a", "avg_ask_b"]].min(axis=1)
     )
     merged = merged[
         (price_ratio <= 1.5) & (merged["spread_pct"].abs() <= 20.0)
