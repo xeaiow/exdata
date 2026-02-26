@@ -106,6 +106,29 @@ async fn fetch_book_tickers(client: &reqwest::Client) -> Vec<RestBookTicker> {
     }
 }
 
+// ── Funding info refresher ───────────────────────────────────────────────────
+
+/// Periodically refreshes funding info (rate_interval, rate_max) without restarting WS.
+async fn funding_refresher(cache: SharedCache, client: reqwest::Client) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.tick().await; // skip immediate tick (coordinator just seeded)
+
+    loop {
+        interval.tick().await;
+        let funding_info = fetch_funding_info(&client).await;
+        if funding_info.is_empty() {
+            continue;
+        }
+        let mut section = cache.binance_future.write().await;
+        for (sym, (interval_h, max_rate)) in &funding_info {
+            if let Some(item) = section.items.get_mut(sym) {
+                item.rate_interval = Some(*interval_h);
+                item.rate_max = Some(max_rate.clone());
+            }
+        }
+    }
+}
+
 // ── Futures (coordinator + chunk worker) ────────────────────────────────────
 
 /// Coordinator: fetches funding info, seeds REST, spawns single chunk worker, restarts every 5 min.
@@ -148,20 +171,18 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let item = section
                     .items
                     .entry(bt.symbol.clone())
-                    .or_insert_with(|| {
-                        let mut ei = ExchangeItem {
-                            name: bt.symbol.clone(),
-                            ..Default::default()
-                        };
-                        if let Some((interval, max_rate)) = funding_info.get(&bt.symbol) {
-                            ei.rate_interval = Some(*interval);
-                            ei.rate_max = Some(max_rate.clone());
-                        }
-                        ei
+                    .or_insert_with(|| ExchangeItem {
+                        name: bt.symbol.clone(),
+                        ..Default::default()
                     });
                 item.a = parse_f64(&bt.ask_price);
                 item.b = parse_f64(&bt.bid_price);
                 item.ts = ts;
+                // Always refresh funding info from REST (exchange may change intervals dynamically)
+                if let Some((interval, max_rate)) = funding_info.get(&bt.symbol) {
+                    item.rate_interval = Some(*interval);
+                    item.rate_max = Some(max_rate.clone());
+                }
             }
             tracing::info!(
                 "binance futures: seeded {} book tickers from REST",
@@ -183,10 +204,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             0,
         ));
 
-        // Sleep 5 minutes, then abort and restart
+        // Spawn funding info refresher (updates rate_interval/rate_max every 60s)
+        let refresher_handle = tokio::spawn(funding_refresher(cache.clone(), client.clone()));
+
+        // Sleep 5 minutes, then abort worker + refresher and restart
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
         tracing::info!("binance futures: coordinator restarting, aborting worker");
+        refresher_handle.abort();
+        let _ = refresher_handle.await;
         handle.abort();
         let _ = handle.await;
     }

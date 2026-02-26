@@ -123,6 +123,30 @@ async fn fetch_futures_contracts(client: &reqwest::Client) -> ContractInfo {
     }
 }
 
+// ── Funding info refresher ───────────────────────────────────────────────────
+
+/// Periodically refreshes funding info (rate_interval, rate_max) without restarting WS.
+async fn funding_refresher(cache: SharedCache, client: reqwest::Client) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.tick().await; // skip immediate tick (coordinator just seeded)
+
+    loop {
+        interval.tick().await;
+        let contract_info = fetch_futures_contracts(&client).await;
+        if contract_info.funding_info.is_empty() {
+            continue;
+        }
+        let mut section = cache.gate_future.write().await;
+        for (raw_name, (interval_h, max_rate)) in &contract_info.funding_info {
+            let normalized = normalize_symbol(raw_name);
+            if let Some(item) = section.items.get_mut(&normalized) {
+                item.rate_interval = Some(*interval_h);
+                item.rate_max = Some(max_rate.clone());
+            }
+        }
+    }
+}
+
 // ── Futures (coordinator + chunk workers) ─────────────────────────────────
 
 /// Coordinator: fetches contracts, seeds REST, spawns chunk workers, restarts every 5 min.
@@ -160,23 +184,21 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let item = section
                     .items
                     .entry(normalized.clone())
-                    .or_insert_with(|| {
-                        let mut ei = ExchangeItem {
-                            name: normalized,
-                            ..Default::default()
-                        };
-                        if let Some((interval, max_rate)) =
-                            contract_info.funding_info.get(&t.contract)
-                        {
-                            ei.rate_interval = Some(*interval);
-                            ei.rate_max = Some(max_rate.clone());
-                        }
-                        ei
+                    .or_insert_with(|| ExchangeItem {
+                        name: normalized,
+                        ..Default::default()
                     });
                 item.a = parse_f64(&t.lowest_ask);
                 item.b = parse_f64(&t.highest_bid);
                 item.ts = ts;
                 item.trade24_count = parse_f64(&t.volume_24h_quote);
+                // Always refresh funding info from REST (exchange may change intervals dynamically)
+                if let Some((interval, max_rate)) =
+                    contract_info.funding_info.get(&t.contract)
+                {
+                    item.rate_interval = Some(*interval);
+                    item.rate_max = Some(max_rate.clone());
+                }
             }
             tracing::info!(
                 "gate futures: seeded {} tickers from REST",
@@ -207,10 +229,15 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             handles.push(handle);
         }
 
-        // Sleep 5 minutes, then abort all chunks and restart
+        // Spawn funding info refresher (updates rate_interval/rate_max every 60s)
+        let refresher_handle = tokio::spawn(funding_refresher(cache.clone(), client.clone()));
+
+        // Sleep 5 minutes, then abort all chunks + refresher and restart
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
         tracing::info!("gate futures: coordinator restarting, aborting {} chunks", handles.len());
+        refresher_handle.abort();
+        let _ = refresher_handle.await;
         for h in &handles {
             h.abort();
         }
