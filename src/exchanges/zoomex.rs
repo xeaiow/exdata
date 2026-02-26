@@ -92,7 +92,8 @@ struct RestTickerItem {
 }
 
 async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<RestTickerItem> {
-    let url = "https://openapi.zoomex.com/cloud/trade/v3/market/tickers?category=linear";
+    // Zoomex 是 Bybit 藍標，公開市場數據相同，Bybit v5 API 回傳更完整
+    let url = "https://api.bybit.com/v5/market/tickers?category=linear";
     let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -116,72 +117,16 @@ struct FuturesInstrumentData {
     funding_info: HashMap<String, (u32, String)>,
 }
 
-/// Fetch funding rate caps from Bybit's v5 API (Zoomex's v3 API lacks upperFundingRate).
-/// Returns symbol -> max rate percentage string (e.g. "2.000").
-async fn fetch_bybit_funding_caps(client: &reqwest::Client) -> HashMap<String, String> {
-    let mut caps = HashMap::new();
-    let mut cursor: Option<String> = None;
-
-    loop {
-        let mut url =
-            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-                .to_string();
-        if let Some(ref c) = cursor {
-            if !c.is_empty() {
-                url.push_str(&format!("&cursor={}", c));
-            }
-        }
-
-        let resp = match client.get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("zoomex futures: bybit funding caps fetch failed: {}", e);
-                break;
-            }
-        };
-
-        let body: InstrumentsResponse = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("zoomex futures: bybit funding caps parse failed: {}", e);
-                break;
-            }
-        };
-
-        for info in &body.result.list {
-            if let Some(ref rate) = info.upper_funding_rate {
-                let v = parse_f64(rate);
-                caps.insert(info.symbol.clone(), format!("{:.3}", v * 100.0));
-            }
-        }
-
-        match body.result.next_page_cursor {
-            Some(ref c) if !c.is_empty() => cursor = Some(c.clone()),
-            _ => break,
-        }
-    }
-
-    caps
-}
-
 /// Fetch linear perpetual instrument info (USDT quote, LinearPerpetual, Trading).
+/// Uses Bybit v5 API (Zoomex is Bybit white-label, identical symbols and funding data).
 async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumentData {
     let mut symbols = Vec::new();
     let mut funding_info: HashMap<String, (u32, String)> = HashMap::new();
     let mut cursor: Option<String> = None;
 
-    // Fetch funding rate caps from Bybit (Zoomex v3 API lacks this field)
-    let bybit_caps = fetch_bybit_funding_caps(client).await;
-    if !bybit_caps.is_empty() {
-        tracing::info!(
-            "zoomex futures: loaded {} funding rate caps from Bybit",
-            bybit_caps.len()
-        );
-    }
-
     loop {
         let mut url =
-            "https://openapi.zoomex.com/cloud/trade/v3/market/instruments-info?category=linear&limit=1000"
+            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
                 .to_string();
         if let Some(ref c) = cursor {
             if !c.is_empty() {
@@ -212,9 +157,13 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
             if info.quote_coin == "USDT" && info.status == "Trading" && is_perp && info.symbol != "ALLUSDT" {
                 symbols.push(info.symbol.clone());
                 let interval_hours = info.funding_interval.unwrap_or(480) / 60;
-                let rate_max = bybit_caps
-                    .get(&info.symbol)
-                    .cloned()
+                let rate_max = info
+                    .upper_funding_rate
+                    .as_deref()
+                    .map(|s| {
+                        let v = parse_f64(s);
+                        format!("{:.3}", v * 100.0)
+                    })
                     .unwrap_or_else(|| "--".to_string());
                 funding_info.insert(
                     info.symbol.clone(),
