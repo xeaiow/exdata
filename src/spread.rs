@@ -244,10 +244,10 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 
 // ── Spread calculator task ─────────────────────────────────────────────────
 
-/// Spread calculator task: runs on a fixed 100ms interval, drains all pending
-/// TickerChanged events, deduplicates by symbol, and computes spreads for the
-/// changed symbols. On lag, performs a full refresh across all symbols so that
-/// downstream consumers never starve for data.
+/// Spread calculator task: event-driven, wakes immediately on TickerChanged via
+/// `recv().await`, then drains all pending events, deduplicates by symbol, and
+/// computes spreads for the changed symbols. On lag, performs a full refresh
+/// across all symbols so that downstream consumers never starve for data.
 ///
 /// Tiered throttle: spread > 3% → immediate, spread ≤ 3% → max once per 500ms per pair.
 pub async fn run_spread_calculator(
@@ -259,20 +259,29 @@ pub async fn run_spread_calculator(
     let mut last_sent: std::collections::HashMap<(String, &'static str, &'static str), u64> =
         std::collections::HashMap::new();
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-
     loop {
-        interval.tick().await;
-
-        // Drain all pending events from the broadcast channel
+        // Wait for the first ticker change event (zero-latency wakeup)
         let mut changed = HashSet::new();
         let mut do_full_refresh = false;
 
+        match ticker_rx.recv().await {
+            Ok(e) => { changed.insert(e.symbol); }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!("spread calculator: lagged {} events", n);
+                do_full_refresh = true;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::error!("spread calculator: ticker channel closed");
+                return;
+            }
+        }
+
+        // Drain all remaining pending events (dedup, batch processing)
         loop {
             match ticker_rx.try_recv() {
                 Ok(e) => { changed.insert(e.symbol); }
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::debug!("spread calculator: lagged {} events", n);
+                    tracing::debug!("spread calculator: lagged {} events (drain)", n);
                     do_full_refresh = true;
                     // After Lagged, the receiver is reset — continue draining
                 }
@@ -286,8 +295,6 @@ pub async fn run_spread_calculator(
 
         let symbols: Vec<String> = if do_full_refresh {
             collect_all_symbols(&cache).await
-        } else if changed.is_empty() {
-            continue; // Nothing to process this tick
         } else {
             changed.into_iter().collect()
         };
