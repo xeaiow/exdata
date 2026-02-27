@@ -187,6 +187,11 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                 long.depth_ts.min(short.depth_ts)
             };
 
+            // Only include L2 depth if both sides are fresh (within 5s of ticker ts).
+            // Stale depth can have prices far off from current bookTicker, causing
+            // downstream verification to compute a wildly wrong spread.
+            let depth_fresh = depth_ts > 0 && ts.saturating_sub(depth_ts) <= 5_000;
+
             results.push(SpreadOpportunity {
                 symbol: symbol.to_string(),
                 long_exchange: long.exchange.as_str(),
@@ -200,8 +205,8 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                     long: long.volume_24h,
                     short: short.volume_24h,
                 },
-                long_asks: long.asks.clone(),
-                short_bids: short.bids.clone(),
+                long_asks: if depth_fresh { long.asks.clone() } else { Vec::new() },
+                short_bids: if depth_fresh { short.bids.clone() } else { Vec::new() },
                 ts,
                 depth_ts,
             });
