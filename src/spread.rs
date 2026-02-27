@@ -244,7 +244,7 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 
 // ── Spread calculator task ─────────────────────────────────────────────────
 
-/// Spread calculator task: runs on a fixed 200ms interval, drains all pending
+/// Spread calculator task: runs on a fixed 100ms interval, drains all pending
 /// TickerChanged events, deduplicates by symbol, and computes spreads for the
 /// changed symbols. On lag, performs a full refresh across all symbols so that
 /// downstream consumers never starve for data.
@@ -259,7 +259,7 @@ pub async fn run_spread_calculator(
     let mut last_sent: std::collections::HashMap<(String, &'static str, &'static str), u64> =
         std::collections::HashMap::new();
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
     loop {
         interval.tick().await;
