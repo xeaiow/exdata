@@ -92,6 +92,8 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
     let now = now_ms();
     let mut tickers = Vec::new();
 
+    // Read each section sequentially — acquire and release one lock at a time
+    // to avoid potential deadlocks with the background serializer's write locks.
     let sections = [
         (ExchangeName::Binance, &cache.binance_future),
         (ExchangeName::Bybit, &cache.bybit_future),
@@ -237,8 +239,10 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 
 // ── Spread calculator task ─────────────────────────────────────────────────
 
-/// Spread calculator task: listens for TickerChanged events, computes spreads,
-/// and broadcasts SpreadOpportunity updates to all WS clients.
+/// Spread calculator task: runs on a fixed 200ms interval, drains all pending
+/// TickerChanged events, deduplicates by symbol, and computes spreads for the
+/// changed symbols. On lag, performs a full refresh across all symbols so that
+/// downstream consumers never starve for data.
 ///
 /// Tiered throttle: spread > 3% → immediate, spread ≤ 3% → max once per 500ms per pair.
 pub async fn run_spread_calculator(
@@ -250,49 +254,70 @@ pub async fn run_spread_calculator(
     let mut last_sent: std::collections::HashMap<(String, &'static str, &'static str), u64> =
         std::collections::HashMap::new();
 
-    loop {
-        let event = match ticker_rx.recv().await {
-            Ok(e) => e,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("spread calculator: lagged {} events, continuing", n);
-                continue;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                tracing::error!("spread calculator: ticker channel closed");
-                break;
-            }
-        };
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
 
-        // Read tickers for the changed symbol across all exchanges
-        let tickers = read_symbol_tickers(&cache, &event.symbol).await;
-        if tickers.len() < 2 {
-            continue; // Need at least 2 exchanges
+    loop {
+        interval.tick().await;
+
+        // Drain all pending events from the broadcast channel
+        let mut changed = HashSet::new();
+        let mut do_full_refresh = false;
+
+        loop {
+            match ticker_rx.try_recv() {
+                Ok(e) => { changed.insert(e.symbol); }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::debug!("spread calculator: lagged {} events", n);
+                    do_full_refresh = true;
+                    // After Lagged, the receiver is reset — continue draining
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    tracing::error!("spread calculator: ticker channel closed");
+                    return;
+                }
+            }
         }
 
-        // Compute all spread pairs for this symbol
-        let opportunities = compute_spreads(&event.symbol, &tickers);
+        let symbols: Vec<String> = if do_full_refresh {
+            collect_all_symbols(&cache).await
+        } else if changed.is_empty() {
+            continue; // Nothing to process this tick
+        } else {
+            changed.into_iter().collect()
+        };
+
         let now = now_ms();
 
-        for opp in opportunities {
-            let key = (
-                opp.symbol.clone(),
-                opp.long_exchange,
-                opp.short_exchange,
-            );
+        for symbol in &symbols {
+            let tickers = read_symbol_tickers(&cache, symbol).await;
+            if tickers.len() < 2 {
+                continue;
+            }
 
-            // Tiered throttle
-            let should_send = if opp.spread_percent > 3.0 {
-                true // High-value: always send immediately
-            } else {
-                match last_sent.get(&key) {
-                    Some(&last_ts) => now.saturating_sub(last_ts) >= 500,
-                    None => true,
+            let opportunities = compute_spreads(symbol, &tickers);
+
+            for opp in opportunities {
+                let key = (
+                    opp.symbol.clone(),
+                    opp.long_exchange,
+                    opp.short_exchange,
+                );
+
+                // Tiered throttle
+                let should_send = if opp.spread_percent > 3.0 {
+                    true // High-value: always send immediately
+                } else {
+                    match last_sent.get(&key) {
+                        Some(&last_ts) => now.saturating_sub(last_ts) >= 500,
+                        None => true,
+                    }
+                };
+
+                if should_send {
+                    last_sent.insert(key, now);
+                    let _ = spread_tx.send(opp);
                 }
-            };
-
-            if should_send {
-                last_sent.insert(key, now);
-                let _ = spread_tx.send(opp);
             }
         }
     }

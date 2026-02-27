@@ -76,9 +76,14 @@ pub async fn run(cache: SharedCache, client: reqwest::Client, config: ValidatorC
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(config.interval_secs));
     interval.tick().await; // consume the immediate first tick
 
+    // Track which exchanges had 0 items in the previous cycle.
+    // Only alert on the second consecutive 0-items occurrence to suppress
+    // transient startup / restart blips.
+    let mut prev_empty: [bool; EXCHANGES.len()] = [false; EXCHANGES.len()];
+
     loop {
         interval.tick().await;
-        if let Err(e) = run_cycle(&cache, &client, &config).await {
+        if let Err(e) = run_cycle(&cache, &client, &config, &mut prev_empty).await {
             tracing::error!("validator: cycle error: {}", e);
         }
     }
@@ -88,6 +93,7 @@ async fn run_cycle(
     cache: &SharedCache,
     client: &reqwest::Client,
     config: &ValidatorConfig,
+    prev_empty: &mut [bool; EXCHANGES.len()],
 ) -> Result<(), String> {
     // 1. Fetch baseline
     let ts = std::time::SystemTime::now()
@@ -143,16 +149,26 @@ async fn run_cycle(
                 "validator: {}: coordinator 重啟中，跳過本輪",
                 mapping.display_name
             );
+            prev_empty[idx] = false; // reset so restart doesn't count as first empty
             continue;
         }
 
-        // Check disconnection
+        // Check disconnection: only alert on second consecutive 0-items cycle
         if own.is_empty() {
-            let msg = format!("{}: 斷線 (0 items，基準有 {} 個)", mapping.display_name, bl_count);
-            tracing::warn!("validator: {}", msg);
-            alerts.push(msg);
+            if prev_empty[idx] {
+                let msg = format!("{}: 斷線 (0 items，基準有 {} 個)", mapping.display_name, bl_count);
+                tracing::warn!("validator: {}", msg);
+                alerts.push(msg);
+            } else {
+                tracing::info!(
+                    "validator: {}: 0 items (基準有 {})，等待下一輪確認",
+                    mapping.display_name, bl_count
+                );
+                prev_empty[idx] = true;
+            }
             continue;
         }
+        prev_empty[idx] = false;
 
         let bl_map = match bl_items {
             Some(m) => m,
