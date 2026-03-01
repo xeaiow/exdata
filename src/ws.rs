@@ -3,7 +3,7 @@ use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -76,47 +76,86 @@ async fn handle_ws(mut socket: WebSocket, state: SharedWsState, min_spread: f64)
     loop {
         tokio::select! {
             result = spread_rx.recv() => {
+                // Drain: collect the first message + all immediately available messages
+                let mut pending: HashMap<(String, &'static str, &'static str), SpreadOpportunity> = HashMap::new();
+                let mut need_snapshot = false;
+                let mut closed = false;
+
                 match result {
                     Ok(opp) => {
                         let key = (opp.symbol.clone(), opp.long_exchange, opp.short_exchange);
-
-                        let should_send = if opp.spread_percent >= min_spread {
-                            // Above threshold: send and track
-                            sent_pairs.insert(key);
-                            true
-                        } else if sent_pairs.remove(&key) {
-                            // Crossed below threshold: send final update
-                            true
-                        } else {
-                            false
-                        };
-
-                        if should_send {
-                            let msg = SpreadMessage::Update { data: opp };
-                            let json = match serde_json::to_string(&msg) {
-                                Ok(j) => j,
-                                Err(_) => continue,
-                            };
-                            if socket.send(Message::Text(Utf8Bytes::from(json))).await.is_err() {
-                                break;
-                            }
-                        }
+                        pending.insert(key, opp);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("ws/spreads: client lagged {} updates", n);
-                        let snapshot = build_snapshot(&state.cache, min_spread).await;
-                        sent_pairs.clear();
-                        for opp in &snapshot {
-                            sent_pairs.insert((opp.symbol.clone(), opp.long_exchange, opp.short_exchange));
-                        }
-                        let msg = SpreadMessage::Snapshot { data: snapshot };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if socket.send(Message::Text(Utf8Bytes::from(json))).await.is_err() {
+                        need_snapshot = true;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => { closed = true; }
+                }
+
+                if closed { break; }
+
+                // Non-blocking drain: grab everything already buffered
+                if !need_snapshot {
+                    loop {
+                        match spread_rx.try_recv() {
+                            Ok(opp) => {
+                                let key = (opp.symbol.clone(), opp.long_exchange, opp.short_exchange);
+                                pending.insert(key, opp);
+                            }
+                            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                                tracing::warn!("ws/spreads: client lagged {} updates (during drain)", n);
+                                need_snapshot = true;
                                 break;
                             }
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            Err(broadcast::error::TryRecvError::Closed) => { closed = true; break; }
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    if closed { break; }
+                }
+
+                // If lagged, send full snapshot
+                if need_snapshot {
+                    let snapshot = build_snapshot(&state.cache, min_spread).await;
+                    sent_pairs.clear();
+                    for opp in &snapshot {
+                        sent_pairs.insert((opp.symbol.clone(), opp.long_exchange, opp.short_exchange));
+                    }
+                    let msg = SpreadMessage::Snapshot { data: snapshot };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if socket.send(Message::Text(Utf8Bytes::from(json))).await.is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // Filter by min_spread and track threshold crossings
+                let mut to_send: Vec<SpreadOpportunity> = Vec::new();
+                for (key, opp) in pending {
+                    if opp.spread_percent >= min_spread {
+                        sent_pairs.insert(key);
+                        to_send.push(opp);
+                    } else if sent_pairs.remove(&key) {
+                        to_send.push(opp);
+                    }
+                }
+
+                // Send batch
+                if !to_send.is_empty() {
+                    let msg = if to_send.len() == 1 {
+                        SpreadMessage::Update { data: to_send.into_iter().next().unwrap() }
+                    } else {
+                        SpreadMessage::BatchUpdate { data: to_send }
+                    };
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(j) => j,
+                        Err(_) => continue,
+                    };
+                    if socket.send(Message::Text(Utf8Bytes::from(json))).await.is_err() {
+                        break;
+                    }
                 }
             }
             msg = socket.recv() => {

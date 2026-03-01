@@ -71,6 +71,7 @@ fn is_zero_u64(v: &u64) -> bool {
 pub enum SpreadMessage {
     Snapshot { data: Vec<SpreadOpportunity> },
     Update { data: SpreadOpportunity },
+    BatchUpdate { data: Vec<SpreadOpportunity> },
 }
 
 // ── Internal ticker struct ──────────────────────────────────────────────────
