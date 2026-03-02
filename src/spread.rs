@@ -27,6 +27,18 @@ impl ExchangeName {
             ExchangeName::Zoomex => "zoomex",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "binance" => Some(ExchangeName::Binance),
+            "bybit" => Some(ExchangeName::Bybit),
+            "okx" => Some(ExchangeName::Okx),
+            "gate" => Some(ExchangeName::Gate),
+            "bitget" => Some(ExchangeName::Bitget),
+            "zoomex" => Some(ExchangeName::Zoomex),
+            _ => None,
+        }
+    }
 }
 
 // ── Event / message types ───────────────────────────────────────────────────
@@ -127,6 +139,30 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
     }
 
     tickers
+}
+
+/// Read a single exchange's ticker for a symbol without freshness filtering.
+/// Returns (ask, bid, ts) or None if the symbol doesn't exist or prices are invalid.
+pub async fn read_exchange_ticker(
+    cache: &SharedCache,
+    exchange: ExchangeName,
+    symbol: &str,
+) -> Option<(f64, f64, u64)> {
+    let lock = match exchange {
+        ExchangeName::Binance => &cache.binance_future,
+        ExchangeName::Bybit => &cache.bybit_future,
+        ExchangeName::Okx => &cache.okx_future,
+        ExchangeName::Gate => &cache.gate_future,
+        ExchangeName::Bitget => &cache.bitget_future,
+        ExchangeName::Zoomex => &cache.zoomex_future,
+    };
+    let section = lock.read().await;
+    if let Some(item) = section.items.get(symbol) {
+        if item.ts > 0 && item.a > 0.0 && item.b > 0.0 {
+            return Some((item.a, item.b, item.ts));
+        }
+    }
+    None
 }
 
 // ── Compute spreads for a symbol ────────────────────────────────────────────
@@ -250,7 +286,7 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 /// computes spreads for the changed symbols. On lag, performs a full refresh
 /// across all symbols so that downstream consumers never starve for data.
 ///
-/// Tiered throttle: spread > 3% → immediate, spread ≤ 3% → max once per 500ms per pair.
+/// Throttle: max once per 500ms per pair.
 pub async fn run_spread_calculator(
     cache: SharedCache,
     mut ticker_rx: tokio::sync::broadcast::Receiver<TickerChanged>,
@@ -317,14 +353,10 @@ pub async fn run_spread_calculator(
                     opp.short_exchange,
                 );
 
-                // Tiered throttle
-                let should_send = if opp.spread_percent > 3.0 {
-                    true // High-value: always send immediately
-                } else {
-                    match last_sent.get(&key) {
-                        Some(&last_ts) => now.saturating_sub(last_ts) >= 500,
-                        None => true,
-                    }
+                // Throttle: max once per 500ms per pair
+                let should_send = match last_sent.get(&key) {
+                    Some(&last_ts) => now.saturating_sub(last_ts) >= 500,
+                    None => true,
                 };
 
                 if should_send {
