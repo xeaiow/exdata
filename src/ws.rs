@@ -19,9 +19,13 @@ pub struct WsState {
 
 pub type SharedWsState = Arc<WsState>;
 
+fn default_min_spread() -> f64 {
+    f64::NEG_INFINITY
+}
+
 #[derive(Deserialize)]
 pub(crate) struct WsQuery {
-    #[serde(default)]
+    #[serde(default = "default_min_spread")]
     min_spread: f64,
 }
 
