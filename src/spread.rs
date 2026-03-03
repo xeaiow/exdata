@@ -187,66 +187,54 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                 continue;
             }
 
-            // Direction 1: long t1 (buy at t1.ask), short t2 (sell at t2.bid)
-            let mid1 = (t1.ask + t2.bid) / 2.0;
-            let spread1 = if mid1 > 0.0 {
-                (t2.bid - t1.ask) / mid1 * 100.0
-            } else {
-                continue;
-            };
+            // Emit both directions so downstream clients always have fresh data
+            // for every (symbol, exchangeA, exchangeB) key.
+            let pairs: [(&SymbolTicker, &SymbolTicker); 2] = [(t1, t2), (t2, t1)];
 
-            // Direction 2: long t2 (buy at t2.ask), short t1 (sell at t1.bid)
-            let mid2 = (t2.ask + t1.bid) / 2.0;
-            let spread2 = if mid2 > 0.0 {
-                (t1.bid - t2.ask) / mid2 * 100.0
-            } else {
-                continue;
-            };
+            for &(long, short) in &pairs {
+                let mid = (long.ask + short.bid) / 2.0;
+                if mid <= 0.0 {
+                    continue;
+                }
+                let spread_pct = (short.bid - long.ask) / mid * 100.0;
 
-            let (long, short, spread_pct) = if spread1 >= spread2 {
-                (t1, t2, spread1)
-            } else {
-                (t2, t1, spread2)
-            };
+                // Skip if spread is unreasonably large
+                if spread_pct.abs() > 20.0 {
+                    continue;
+                }
 
-            // Skip if spread is unreasonably large
-            if spread_pct.abs() > 20.0 {
-                continue;
+                let spread_rounded = (spread_pct * 100.0).round() / 100.0;
+                let ts = long.ts.max(short.ts);
+
+                // Use the older depth_ts (conservative: if either is 0, result is 0)
+                let depth_ts = if long.depth_ts == 0 || short.depth_ts == 0 {
+                    0
+                } else {
+                    long.depth_ts.min(short.depth_ts)
+                };
+
+                // Only include L2 depth if both sides are fresh (within 5s of ticker ts).
+                let depth_fresh = depth_ts > 0 && ts.saturating_sub(depth_ts) <= 5_000;
+
+                results.push(SpreadOpportunity {
+                    symbol: symbol.to_string(),
+                    long_exchange: long.exchange.as_str(),
+                    short_exchange: short.exchange.as_str(),
+                    long_ask: long.ask,
+                    long_bid: long.bid,
+                    short_bid: short.bid,
+                    short_ask: short.ask,
+                    spread_percent: spread_rounded,
+                    volume_24h: Volume24h {
+                        long: long.volume_24h,
+                        short: short.volume_24h,
+                    },
+                    long_asks: if depth_fresh { long.asks.clone() } else { Vec::new() },
+                    short_bids: if depth_fresh { short.bids.clone() } else { Vec::new() },
+                    ts,
+                    depth_ts,
+                });
             }
-
-            let spread_rounded = (spread_pct * 100.0).round() / 100.0;
-            let ts = long.ts.max(short.ts);
-
-            // Use the older depth_ts (conservative: if either is 0, result is 0)
-            let depth_ts = if long.depth_ts == 0 || short.depth_ts == 0 {
-                0
-            } else {
-                long.depth_ts.min(short.depth_ts)
-            };
-
-            // Only include L2 depth if both sides are fresh (within 5s of ticker ts).
-            // Stale depth can have prices far off from current bookTicker, causing
-            // downstream verification to compute a wildly wrong spread.
-            let depth_fresh = depth_ts > 0 && ts.saturating_sub(depth_ts) <= 5_000;
-
-            results.push(SpreadOpportunity {
-                symbol: symbol.to_string(),
-                long_exchange: long.exchange.as_str(),
-                short_exchange: short.exchange.as_str(),
-                long_ask: long.ask,
-                long_bid: long.bid,
-                short_bid: short.bid,
-                short_ask: short.ask,
-                spread_percent: spread_rounded,
-                volume_24h: Volume24h {
-                    long: long.volume_24h,
-                    short: short.volume_24h,
-                },
-                long_asks: if depth_fresh { long.asks.clone() } else { Vec::new() },
-                short_bids: if depth_fresh { short.bids.clone() } else { Vec::new() },
-                ts,
-                depth_ts,
-            });
         }
     }
 
