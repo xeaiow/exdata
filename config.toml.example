@@ -1,10 +1,3 @@
-[validator]
-baseline_url = "https://pulse-api.astro-btc.xyz/api/query/new"
-discord_webhook_url = "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
-interval_secs = 60
-price_threshold_bps = 50
-rate_threshold = 0.01
-
 [recorder]
 enabled = true
 clickhouse_url = "http://localhost:8123"
