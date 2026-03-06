@@ -243,9 +243,13 @@ async fn run_chunk(
                 tracing::info!("okx futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for tickers + funding-rate + books5 channels
+                // Build subscription args for bbo-tbt + tickers + funding-rate + books5 channels
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
                 for inst_id in &symbols {
+                    all_args.push(serde_json::json!({
+                        "channel": "bbo-tbt",
+                        "instId": inst_id
+                    }));
                     all_args.push(serde_json::json!({
                         "channel": "tickers",
                         "instId": inst_id
@@ -364,7 +368,8 @@ async fn run_chunk(
                             let ts = now_ms();
 
                             match channel {
-                                "tickers" => {
+                                "bbo-tbt" => {
+                                    // BBO stream: update bid/ask prices
                                     let inst_id = data
                                         .get("instId")
                                         .and_then(|v| v.as_str())
@@ -372,12 +377,54 @@ async fn run_chunk(
                                     let normalized = normalize_swap(inst_id);
                                     let symbol_for_event = normalized.clone();
 
-                                    let ask_px = data.get("askPx").map(json_f64).unwrap_or(0.0);
-                                    let bid_px = data.get("bidPx").map(json_f64).unwrap_or(0.0);
+                                    let ask_px = data.get("asks")
+                                        .and_then(|v| v.as_array())
+                                        .and_then(|arr| arr.first())
+                                        .and_then(|entry| entry.as_array())
+                                        .and_then(|pair| pair.first())
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| parse_f64(s))
+                                        .unwrap_or(0.0);
+                                    let bid_px = data.get("bids")
+                                        .and_then(|v| v.as_array())
+                                        .and_then(|arr| arr.first())
+                                        .and_then(|entry| entry.as_array())
+                                        .and_then(|pair| pair.first())
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| parse_f64(s))
+                                        .unwrap_or(0.0);
+
+                                    if bid_px > 0.0 || ask_px > 0.0 {
+                                        let mut section = cache.okx_future.write().await;
+                                        section.ts = ts;
+                                        let item = section
+                                            .items
+                                            .entry(normalized.clone())
+                                            .or_insert_with(|| ExchangeItem {
+                                                name: normalized,
+                                                ..Default::default()
+                                            });
+                                        if bid_px > 0.0 { item.b = bid_px; }
+                                        if ask_px > 0.0 { item.a = ask_px; }
+                                        item.ts = ts;
+                                        section.dirty = true;
+                                        drop(section);
+                                        let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                            symbol: symbol_for_event,
+                                        });
+                                    }
+                                }
+                                "tickers" => {
+                                    // bid/ask now driven by bbo-tbt stream (not tickers)
+                                    let inst_id = data
+                                        .get("instId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&arg.inst_id);
+                                    let normalized = normalize_swap(inst_id);
+
                                     let vol_ccy = data.get("volCcy24h").map(json_f64).unwrap_or(0.0);
 
                                     let mut section = cache.okx_future.write().await;
-                                    section.ts = ts;
                                     let item = section
                                         .items
                                         .entry(normalized.clone())
@@ -385,15 +432,9 @@ async fn run_chunk(
                                             name: normalized,
                                             ..Default::default()
                                         });
-                                    item.a = ask_px;
-                                    item.b = bid_px;
-                                    item.ts = ts;
                                     item.trade24_count = vol_ccy;
                                     section.dirty = true;
-                                    drop(section);
-                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                        symbol: symbol_for_event,
-                                    });
+                                    // No TickerChanged here — BBO updates (bbo-tbt) drive spread recalc
                                 }
                                 "funding-rate" => {
                                     let inst_id = data

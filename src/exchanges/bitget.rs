@@ -364,6 +364,14 @@ async fn run_chunk(
                         })
                     })
                     .collect();
+                // Subscribe books1 (BBO) for bid/ask updates
+                args.extend(symbols.iter().map(|s| {
+                    serde_json::json!({
+                        "instType": "USDT-FUTURES",
+                        "channel": "books1",
+                        "instId": s
+                    })
+                }));
                 // Also subscribe to books15 for depth data
                 args.extend(symbols.iter().map(|s| {
                     serde_json::json!({
@@ -446,6 +454,60 @@ async fn run_chunk(
                                 _ => continue,
                             };
 
+                            if arg.channel == "books1" {
+                                // BBO stream: update bid/ask prices
+                                let inst_id = data
+                                    .get("instId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&arg.inst_id);
+
+                                let ask = data.get("asks")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|entry| entry.as_array())
+                                    .and_then(|pair| pair.first())
+                                    .and_then(|v| v.as_str())
+                                    .map(parse_f64)
+                                    .unwrap_or(0.0);
+                                let bid = data.get("bids")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|entry| entry.as_array())
+                                    .and_then(|pair| pair.first())
+                                    .and_then(|v| v.as_str())
+                                    .map(parse_f64)
+                                    .unwrap_or(0.0);
+
+                                if bid > 0.0 || ask > 0.0 {
+                                    let ts = now_ms();
+                                    let inst_id_owned = inst_id.to_string();
+                                    let mut section = cache.bitget_future.write().await;
+                                    let item = section
+                                        .items
+                                        .entry(inst_id_owned.clone())
+                                        .or_insert_with(|| {
+                                            let mut ei = ExchangeItem {
+                                                name: inst_id_owned.clone(),
+                                                ..Default::default()
+                                            };
+                                            if let Some((interval, max_rate)) = funding_info.get(inst_id) {
+                                                ei.rate_interval = Some(*interval);
+                                                ei.rate_max = Some(max_rate.clone());
+                                            }
+                                            ei
+                                        });
+                                    if bid > 0.0 { item.b = bid; }
+                                    if ask > 0.0 { item.a = ask; }
+                                    item.ts = ts;
+                                    section.dirty = true;
+                                    drop(section);
+                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                        symbol: inst_id_owned,
+                                    });
+                                }
+                                continue;
+                            }
+
                             if arg.channel == "books15" || arg.channel == "books5" {
                                 let inst_id = data
                                     .get("instId")
@@ -510,8 +572,7 @@ async fn run_chunk(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(&arg.inst_id);
 
-                            let ask_pr = data.get("askPr").map(json_f64).unwrap_or(0.0);
-                            let bid_pr = data.get("bidPr").map(json_f64).unwrap_or(0.0);
+                            // bid/ask now driven by books1 BBO stream (not ticker)
                             let quote_volume = data.get("quoteVolume").map(json_f64).unwrap_or(0.0);
                             let rate_dec = data.get("fundingRate").map(json_f64).unwrap_or(0.0);
                             let mark_price = data.get("markPrice").map(json_f64).unwrap_or(0.0);
@@ -519,9 +580,7 @@ async fn run_chunk(
 
                             let rate_str = format!("{:.3}", rate_dec * 100.0);
 
-                            let ts = now_ms();
                             let mut section = cache.bitget_future.write().await;
-                            section.ts = ts;
 
                             let item = section
                                 .items
@@ -538,9 +597,6 @@ async fn run_chunk(
                                     ei
                                 });
 
-                            item.a = ask_pr;
-                            item.b = bid_pr;
-                            item.ts = ts;
                             item.trade24_count = quote_volume;
                             item.rate = Some(rate_str);
                             item.mark_price = Some(format!("{}", mark_price));
@@ -554,10 +610,7 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
-                            drop(section);
-                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                symbol: inst_id.to_string(),
-                            });
+                            // No TickerChanged here — BBO updates (books1) drive spread recalc
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
                             tracing::warn!("bitget futures chunk-{}: no message for 30s, reconnecting", chunk_id);

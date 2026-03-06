@@ -52,10 +52,6 @@ struct WsMsg {
 #[derive(Deserialize)]
 struct TickerData {
     symbol: String,
-    #[serde(rename = "ask1Price", default)]
-    ask1_price: Option<String>,
-    #[serde(rename = "bid1Price", default)]
-    bid1_price: Option<String>,
     #[serde(rename = "turnover24h", default)]
     turnover_24h: Option<String>,
     #[serde(rename = "fundingRate", default)]
@@ -345,7 +341,24 @@ async fn run_chunk(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                // Subscribe orderbook.50 in separate batches of 10
+                // Subscribe orderbook.1 (BBO) in batches of 10
+                if !subscribe_failed {
+                    for chunk in symbols.chunks(10) {
+                        let args: Vec<String> =
+                            chunk.iter().map(|s| format!("orderbook.1.{}", s)).collect();
+                        let sub = serde_json::json!({
+                            "op": "subscribe",
+                            "args": args
+                        });
+                        if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
+                            tracing::error!("zoomex futures chunk-{}: BBO subscribe send error: {}", chunk_id, e);
+                            subscribe_failed = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                // Subscribe orderbook.50 (L2 depth) in separate batches of 10
                 if !subscribe_failed {
                     for chunk in symbols.chunks(10) {
                         let args: Vec<String> =
@@ -421,6 +434,59 @@ async fn run_chunk(
                                 Some(v) => v,
                                 None => continue,
                             };
+
+                            if topic.starts_with("orderbook.1.") {
+                                // BBO stream: update bid/ask prices on every message (snapshot + delta)
+                                let symbol = topic.strip_prefix("orderbook.1.").unwrap_or("").to_string();
+                                if symbol.is_empty() {
+                                    continue;
+                                }
+
+                                let bid = data_val.get("b")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|entry| entry.as_array())
+                                    .and_then(|pair| pair.first())
+                                    .and_then(|v| v.as_str())
+                                    .map(parse_f64)
+                                    .unwrap_or(0.0);
+                                let ask = data_val.get("a")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|entry| entry.as_array())
+                                    .and_then(|pair| pair.first())
+                                    .and_then(|v| v.as_str())
+                                    .map(parse_f64)
+                                    .unwrap_or(0.0);
+
+                                if bid > 0.0 || ask > 0.0 {
+                                    let ts = ws_msg.ts.unwrap_or_else(now_ms);
+                                    let mut section = cache.zoomex_future.write().await;
+                                    let item = section
+                                        .items
+                                        .entry(symbol.clone())
+                                        .or_insert_with(|| {
+                                            let mut ei = ExchangeItem {
+                                                name: symbol.clone(),
+                                                ..Default::default()
+                                            };
+                                            if let Some((interval, max_rate)) = funding_info.get(&symbol) {
+                                                ei.rate_interval = Some(*interval);
+                                                ei.rate_max = Some(max_rate.clone());
+                                            }
+                                            ei
+                                        });
+                                    if bid > 0.0 { item.b = bid; }
+                                    if ask > 0.0 { item.a = ask; }
+                                    item.ts = ts;
+                                    section.dirty = true;
+                                    drop(section);
+                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
+                                        symbol: symbol.clone(),
+                                    });
+                                }
+                                continue;
+                            }
 
                             if topic.starts_with("orderbook.50.") {
                                 // Only process snapshot (ignore delta to avoid partial overwrites)
@@ -511,15 +577,7 @@ async fn run_chunk(
                                     ei
                                 });
 
-                            // Delta messages only have partial fields; only update what's present
-                            if let Some(ref v) = ticker.ask1_price {
-                                item.a = parse_f64(v);
-                                item.ts = ts;
-                            }
-                            if let Some(ref v) = ticker.bid1_price {
-                                item.b = parse_f64(v);
-                                item.ts = ts;
-                            }
+                            // bid/ask now driven by orderbook.1 BBO stream (not tickers)
                             if let Some(ref v) = ticker.turnover_24h {
                                 item.trade24_count = parse_f64(v);
                             }
@@ -542,10 +600,7 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
-                            drop(section);
-                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                symbol: ticker.symbol.clone(),
-                            });
+                            // No TickerChanged here — BBO updates (orderbook.1) drive spread recalc
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
                             tracing::warn!("zoomex futures chunk-{}: no message for 30s, reconnecting", chunk_id);
