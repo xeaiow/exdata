@@ -27,6 +27,18 @@ impl ExchangeName {
             ExchangeName::Zoomex => "zoomex",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "binance" => Some(ExchangeName::Binance),
+            "bybit" => Some(ExchangeName::Bybit),
+            "okx" => Some(ExchangeName::Okx),
+            "gate" => Some(ExchangeName::Gate),
+            "bitget" => Some(ExchangeName::Bitget),
+            "zoomex" => Some(ExchangeName::Zoomex),
+            _ => None,
+        }
+    }
 }
 
 // ── Event / message types ───────────────────────────────────────────────────
@@ -58,6 +70,12 @@ pub struct SpreadOpportunity {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub short_bids: Vec<PriceLevel>,
     pub ts: u64,
+    #[serde(rename = "depthTs", skip_serializing_if = "is_zero_u64")]
+    pub depth_ts: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize)]
@@ -65,6 +83,7 @@ pub struct SpreadOpportunity {
 pub enum SpreadMessage {
     Snapshot { data: Vec<SpreadOpportunity> },
     Update { data: SpreadOpportunity },
+    BatchUpdate { data: Vec<SpreadOpportunity> },
 }
 
 // ── Internal ticker struct ──────────────────────────────────────────────────
@@ -74,6 +93,7 @@ pub struct SymbolTicker {
     pub ask: f64,
     pub bid: f64,
     pub ts: u64,
+    pub depth_ts: u64,
     pub volume_24h: f64,
     pub asks: Vec<crate::models::PriceLevel>,
     pub bids: Vec<crate::models::PriceLevel>,
@@ -85,6 +105,8 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
     let now = now_ms();
     let mut tickers = Vec::new();
 
+    // Read each section sequentially — acquire and release one lock at a time
+    // to avoid potential deadlocks with the background serializer's write locks.
     let sections = [
         (ExchangeName::Binance, &cache.binance_future),
         (ExchangeName::Bybit, &cache.bybit_future),
@@ -108,6 +130,7 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
                 ask: item.a,
                 bid: item.b,
                 ts: item.ts,
+                depth_ts: item.depth_ts,
                 volume_24h: item.trade24_count,
                 asks: item.asks.clone(),
                 bids: item.bids.clone(),
@@ -116,6 +139,30 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
     }
 
     tickers
+}
+
+/// Read a single exchange's ticker for a symbol without freshness filtering.
+/// Returns (ask, bid, ts) or None if the symbol doesn't exist or prices are invalid.
+pub async fn read_exchange_ticker(
+    cache: &SharedCache,
+    exchange: ExchangeName,
+    symbol: &str,
+) -> Option<(f64, f64, u64)> {
+    let lock = match exchange {
+        ExchangeName::Binance => &cache.binance_future,
+        ExchangeName::Bybit => &cache.bybit_future,
+        ExchangeName::Okx => &cache.okx_future,
+        ExchangeName::Gate => &cache.gate_future,
+        ExchangeName::Bitget => &cache.bitget_future,
+        ExchangeName::Zoomex => &cache.zoomex_future,
+    };
+    let section = lock.read().await;
+    if let Some(item) = section.items.get(symbol) {
+        if item.ts > 0 && item.a > 0.0 && item.b > 0.0 {
+            return Some((item.a, item.b, item.ts));
+        }
+    }
+    None
 }
 
 // ── Compute spreads for a symbol ────────────────────────────────────────────
@@ -140,53 +187,54 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                 continue;
             }
 
-            // Direction 1: long t1 (buy at t1.ask), short t2 (sell at t2.bid)
-            let mid1 = (t1.ask + t2.bid) / 2.0;
-            let spread1 = if mid1 > 0.0 {
-                (t2.bid - t1.ask) / mid1 * 100.0
-            } else {
-                continue;
-            };
+            // Emit both directions so downstream clients always have fresh data
+            // for every (symbol, exchangeA, exchangeB) key.
+            let pairs: [(&SymbolTicker, &SymbolTicker); 2] = [(t1, t2), (t2, t1)];
 
-            // Direction 2: long t2 (buy at t2.ask), short t1 (sell at t1.bid)
-            let mid2 = (t2.ask + t1.bid) / 2.0;
-            let spread2 = if mid2 > 0.0 {
-                (t1.bid - t2.ask) / mid2 * 100.0
-            } else {
-                continue;
-            };
+            for &(long, short) in &pairs {
+                let mid = (long.ask + short.bid) / 2.0;
+                if mid <= 0.0 {
+                    continue;
+                }
+                let spread_pct = (short.bid - long.ask) / mid * 100.0;
 
-            let (long, short, spread_pct) = if spread1 >= spread2 {
-                (t1, t2, spread1)
-            } else {
-                (t2, t1, spread2)
-            };
+                // Skip if spread is unreasonably large
+                if spread_pct.abs() > 20.0 {
+                    continue;
+                }
 
-            // Skip if spread is unreasonably large
-            if spread_pct.abs() > 20.0 {
-                continue;
+                let spread_rounded = (spread_pct * 100.0).round() / 100.0;
+                let ts = long.ts.max(short.ts);
+
+                // Use the older depth_ts (conservative: if either is 0, result is 0)
+                let depth_ts = if long.depth_ts == 0 || short.depth_ts == 0 {
+                    0
+                } else {
+                    long.depth_ts.min(short.depth_ts)
+                };
+
+                // Only include L2 depth if both sides are fresh (within 5s of ticker ts).
+                let depth_fresh = depth_ts > 0 && ts.saturating_sub(depth_ts) <= 5_000;
+
+                results.push(SpreadOpportunity {
+                    symbol: symbol.to_string(),
+                    long_exchange: long.exchange.as_str(),
+                    short_exchange: short.exchange.as_str(),
+                    long_ask: long.ask,
+                    long_bid: long.bid,
+                    short_bid: short.bid,
+                    short_ask: short.ask,
+                    spread_percent: spread_rounded,
+                    volume_24h: Volume24h {
+                        long: long.volume_24h,
+                        short: short.volume_24h,
+                    },
+                    long_asks: if depth_fresh { long.asks.clone() } else { Vec::new() },
+                    short_bids: if depth_fresh { short.bids.clone() } else { Vec::new() },
+                    ts,
+                    depth_ts,
+                });
             }
-
-            let spread_rounded = (spread_pct * 100.0).round() / 100.0;
-            let ts = long.ts.max(short.ts);
-
-            results.push(SpreadOpportunity {
-                symbol: symbol.to_string(),
-                long_exchange: long.exchange.as_str(),
-                short_exchange: short.exchange.as_str(),
-                long_ask: long.ask,
-                long_bid: long.bid,
-                short_bid: short.bid,
-                short_ask: short.ask,
-                spread_percent: spread_rounded,
-                volume_24h: Volume24h {
-                    long: long.volume_24h,
-                    short: short.volume_24h,
-                },
-                long_asks: long.asks.clone(),
-                short_bids: short.bids.clone(),
-                ts,
-            });
         }
     }
 
@@ -221,10 +269,12 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 
 // ── Spread calculator task ─────────────────────────────────────────────────
 
-/// Spread calculator task: listens for TickerChanged events, computes spreads,
-/// and broadcasts SpreadOpportunity updates to all WS clients.
+/// Spread calculator task: event-driven, wakes immediately on TickerChanged via
+/// `recv().await`, then drains all pending events, deduplicates by symbol, and
+/// computes spreads for the changed symbols. On lag, performs a full refresh
+/// across all symbols so that downstream consumers never starve for data.
 ///
-/// Tiered throttle: spread > 3% → immediate, spread ≤ 3% → max once per 500ms per pair.
+/// Throttle: max once per 500ms per pair.
 pub async fn run_spread_calculator(
     cache: SharedCache,
     mut ticker_rx: tokio::sync::broadcast::Receiver<TickerChanged>,
@@ -235,48 +285,72 @@ pub async fn run_spread_calculator(
         std::collections::HashMap::new();
 
     loop {
-        let event = match ticker_rx.recv().await {
-            Ok(e) => e,
+        // Wait for the first ticker change event (zero-latency wakeup)
+        let mut changed = HashSet::new();
+        let mut do_full_refresh = false;
+
+        match ticker_rx.recv().await {
+            Ok(e) => { changed.insert(e.symbol); }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("spread calculator: lagged {} events, continuing", n);
-                continue;
+                tracing::debug!("spread calculator: lagged {} events", n);
+                do_full_refresh = true;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::error!("spread calculator: ticker channel closed");
-                break;
+                return;
             }
-        };
-
-        // Read tickers for the changed symbol across all exchanges
-        let tickers = read_symbol_tickers(&cache, &event.symbol).await;
-        if tickers.len() < 2 {
-            continue; // Need at least 2 exchanges
         }
 
-        // Compute all spread pairs for this symbol
-        let opportunities = compute_spreads(&event.symbol, &tickers);
+        // Drain all remaining pending events (dedup, batch processing)
+        loop {
+            match ticker_rx.try_recv() {
+                Ok(e) => { changed.insert(e.symbol); }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::debug!("spread calculator: lagged {} events (drain)", n);
+                    do_full_refresh = true;
+                    // After Lagged, the receiver is reset — continue draining
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    tracing::error!("spread calculator: ticker channel closed");
+                    return;
+                }
+            }
+        }
+
+        let symbols: Vec<String> = if do_full_refresh {
+            collect_all_symbols(&cache).await
+        } else {
+            changed.into_iter().collect()
+        };
+
         let now = now_ms();
 
-        for opp in opportunities {
-            let key = (
-                opp.symbol.clone(),
-                opp.long_exchange,
-                opp.short_exchange,
-            );
+        for symbol in &symbols {
+            let tickers = read_symbol_tickers(&cache, symbol).await;
+            if tickers.len() < 2 {
+                continue;
+            }
 
-            // Tiered throttle
-            let should_send = if opp.spread_percent > 3.0 {
-                true // High-value: always send immediately
-            } else {
-                match last_sent.get(&key) {
+            let opportunities = compute_spreads(symbol, &tickers);
+
+            for opp in opportunities {
+                let key = (
+                    opp.symbol.clone(),
+                    opp.long_exchange,
+                    opp.short_exchange,
+                );
+
+                // Throttle: max once per 500ms per pair
+                let should_send = match last_sent.get(&key) {
                     Some(&last_ts) => now.saturating_sub(last_ts) >= 500,
                     None => true,
-                }
-            };
+                };
 
-            if should_send {
-                last_sent.insert(key, now);
-                let _ = spread_tx.send(opp);
+                if should_send {
+                    last_sent.insert(key, now);
+                    let _ = spread_tx.send(opp);
+                }
             }
         }
     }

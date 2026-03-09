@@ -92,7 +92,8 @@ struct RestTickerItem {
 }
 
 async fn fetch_futures_tickers(client: &reqwest::Client) -> Vec<RestTickerItem> {
-    let url = "https://openapi.zoomex.com/cloud/trade/v3/market/tickers?category=linear";
+    // Zoomex 是 Bybit 藍標，公開市場數據相同，Bybit v5 API 回傳更完整
+    let url = "https://api.bybit.com/v5/market/tickers?category=linear";
     let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -116,72 +117,16 @@ struct FuturesInstrumentData {
     funding_info: HashMap<String, (u32, String)>,
 }
 
-/// Fetch funding rate caps from Bybit's v5 API (Zoomex's v3 API lacks upperFundingRate).
-/// Returns symbol -> max rate percentage string (e.g. "2.000").
-async fn fetch_bybit_funding_caps(client: &reqwest::Client) -> HashMap<String, String> {
-    let mut caps = HashMap::new();
-    let mut cursor: Option<String> = None;
-
-    loop {
-        let mut url =
-            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-                .to_string();
-        if let Some(ref c) = cursor {
-            if !c.is_empty() {
-                url.push_str(&format!("&cursor={}", c));
-            }
-        }
-
-        let resp = match client.get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("zoomex futures: bybit funding caps fetch failed: {}", e);
-                break;
-            }
-        };
-
-        let body: InstrumentsResponse = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("zoomex futures: bybit funding caps parse failed: {}", e);
-                break;
-            }
-        };
-
-        for info in &body.result.list {
-            if let Some(ref rate) = info.upper_funding_rate {
-                let v = parse_f64(rate);
-                caps.insert(info.symbol.clone(), format!("{:.3}", v * 100.0));
-            }
-        }
-
-        match body.result.next_page_cursor {
-            Some(ref c) if !c.is_empty() => cursor = Some(c.clone()),
-            _ => break,
-        }
-    }
-
-    caps
-}
-
 /// Fetch linear perpetual instrument info (USDT quote, LinearPerpetual, Trading).
+/// Uses Bybit v5 API (Zoomex is Bybit white-label, identical symbols and funding data).
 async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumentData {
     let mut symbols = Vec::new();
     let mut funding_info: HashMap<String, (u32, String)> = HashMap::new();
     let mut cursor: Option<String> = None;
 
-    // Fetch funding rate caps from Bybit (Zoomex v3 API lacks this field)
-    let bybit_caps = fetch_bybit_funding_caps(client).await;
-    if !bybit_caps.is_empty() {
-        tracing::info!(
-            "zoomex futures: loaded {} funding rate caps from Bybit",
-            bybit_caps.len()
-        );
-    }
-
     loop {
         let mut url =
-            "https://openapi.zoomex.com/cloud/trade/v3/market/instruments-info?category=linear&limit=1000"
+            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
                 .to_string();
         if let Some(ref c) = cursor {
             if !c.is_empty() {
@@ -212,9 +157,13 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
             if info.quote_coin == "USDT" && info.status == "Trading" && is_perp && info.symbol != "ALLUSDT" {
                 symbols.push(info.symbol.clone());
                 let interval_hours = info.funding_interval.unwrap_or(480) / 60;
-                let rate_max = bybit_caps
-                    .get(&info.symbol)
-                    .cloned()
+                let rate_max = info
+                    .upper_funding_rate
+                    .as_deref()
+                    .map(|s| {
+                        let v = parse_f64(s);
+                        format!("{:.3}", v * 100.0)
+                    })
                     .unwrap_or_else(|| "--".to_string());
                 funding_info.insert(
                     info.symbol.clone(),
@@ -232,6 +181,29 @@ async fn fetch_futures_instruments(client: &reqwest::Client) -> FuturesInstrumen
     FuturesInstrumentData {
         symbols,
         funding_info,
+    }
+}
+
+// ── Funding info refresher ───────────────────────────────────────────────────
+
+/// Periodically refreshes funding info (rate_interval, rate_max) without restarting WS.
+async fn funding_refresher(cache: SharedCache, client: reqwest::Client) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.tick().await; // skip immediate tick (coordinator just seeded)
+
+    loop {
+        interval.tick().await;
+        let instr = fetch_futures_instruments(&client).await;
+        if instr.funding_info.is_empty() {
+            continue;
+        }
+        let mut section = cache.zoomex_future.write().await;
+        for (sym, (interval_h, max_rate)) in &instr.funding_info {
+            if let Some(item) = section.items.get_mut(sym) {
+                item.rate_interval = Some(*interval_h);
+                item.rate_max = Some(max_rate.clone());
+            }
+        }
     }
 }
 
@@ -271,21 +243,19 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
                 let item = section
                     .items
                     .entry(t.symbol.clone())
-                    .or_insert_with(|| {
-                        let mut ei = ExchangeItem {
-                            name: t.symbol.clone(),
-                            ..Default::default()
-                        };
-                        if let Some((interval, max_rate)) = instr.funding_info.get(&t.symbol) {
-                            ei.rate_interval = Some(*interval);
-                            ei.rate_max = Some(max_rate.clone());
-                        }
-                        ei
+                    .or_insert_with(|| ExchangeItem {
+                        name: t.symbol.clone(),
+                        ..Default::default()
                     });
                 item.a = parse_f64(&t.ask1_price);
                 item.b = parse_f64(&t.bid1_price);
                 item.ts = ts;
                 item.trade24_count = parse_f64(&t.turnover_24h);
+                // Always refresh funding info from REST (exchange may change intervals dynamically)
+                if let Some((interval, max_rate)) = instr.funding_info.get(&t.symbol) {
+                    item.rate_interval = Some(*interval);
+                    item.rate_max = Some(max_rate.clone());
+                }
             }
             tracing::info!(
                 "zoomex futures: seeded {} tickers from REST",
@@ -293,6 +263,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             );
             section.serialize_cache();
         }
+        cache.zoomex_future.write().await.restarting = false;
 
         // Split symbols into chunks of 50 and spawn a worker for each
         let funding_info = std::sync::Arc::new(instr.funding_info);
@@ -316,10 +287,16 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
             handles.push(handle);
         }
 
-        // Sleep 5 minutes, then abort all chunks and restart
+        // Spawn funding info refresher (updates rate_interval/rate_max every 60s)
+        let refresher_handle = tokio::spawn(funding_refresher(cache.clone(), client.clone()));
+
+        // Sleep 5 minutes, then abort all chunks + refresher and restart
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
         tracing::info!("zoomex futures: coordinator restarting, aborting {} chunks", handles.len());
+        cache.zoomex_future.write().await.restarting = true;
+        refresher_handle.abort();
+        let _ = refresher_handle.await;
         for h in &handles {
             h.abort();
         }
@@ -394,6 +371,7 @@ async fn run_chunk(
                 ping_interval.tick().await; // consume the immediate first tick
                 let mut read_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut depth_throttle: std::collections::HashMap<String, tokio::time::Instant> = std::collections::HashMap::new();
 
                 loop {
                     tokio::select! {
@@ -477,12 +455,26 @@ async fn run_chunk(
                                 let asks = parse_levels("a");
 
                                 if !bids.is_empty() || !asks.is_empty() {
-                                    let mut section = cache.zoomex_future.write().await;
-                                    if let Some(item) = section.items.get_mut(&symbol) {
-                                        item.bids = bids;
-                                        item.asks = asks;
+                                    let mut updated = false;
+                                    {
+                                        let mut section = cache.zoomex_future.write().await;
+                                        if let Some(item) = section.items.get_mut(&symbol) {
+                                            item.bids = bids;
+                                            item.asks = asks;
+                                            item.depth_ts = now_ms();
+                                            section.dirty = true;
+                                            updated = true;
+                                        }
                                     }
-                                    section.dirty = true;
+                                    if updated {
+                                        let now_inst = tokio::time::Instant::now();
+                                        let should_fire = depth_throttle.get(&symbol)
+                                            .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));
+                                        if should_fire {
+                                            depth_throttle.insert(symbol.clone(), now_inst);
+                                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged { symbol: symbol.clone() });
+                                        }
+                                    }
                                 }
                                 continue;
                             }

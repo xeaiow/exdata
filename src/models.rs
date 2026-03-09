@@ -1,6 +1,10 @@
 use serde::Serialize;
 use std::collections::HashMap;
 
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Clone, Default, Serialize)]
 pub struct PriceLevel {
     pub price: f64,
@@ -14,6 +18,9 @@ pub struct ExchangeItem {
     pub name: String,
     /// Timestamp (ms) when this item's bid/ask was last updated.
     pub ts: u64,
+    /// Timestamp (ms) when this item's depth (asks/bids) was last updated.
+    #[serde(rename = "depthTs", skip_serializing_if = "is_zero")]
+    pub depth_ts: u64,
     pub a: f64,
     pub b: f64,
     #[serde(rename = "trade24Count")]
@@ -42,6 +49,9 @@ pub struct ExchangeSection {
     pub cached_json: String,
     /// Whether items have been modified since the last serialize_cache() call.
     pub dirty: bool,
+    /// Set to true while the coordinator is restarting (aborting workers → re-seeding).
+    /// Validator skips this section when true to avoid false disconnect alerts.
+    pub restarting: bool,
 }
 
 impl ExchangeSection {
@@ -51,19 +61,12 @@ impl ExchangeSection {
             items: HashMap::new(),
             cached_json: String::new(),
             dirty: false,
+            restarting: true,
         };
         s.serialize_cache();
         s
     }
 
-    /// Clear all items and reset timestamp, then re-serialize.
-    /// Call on WS disconnect to prevent stale data from being served.
-    pub fn clear(&mut self) {
-        self.ts = 0;
-        self.items.clear();
-        self.dirty = false;
-        self.serialize_cache();
-    }
 
     /// Re-serialize the section to JSON. Call after every batch of updates.
     pub fn serialize_cache(&mut self) {

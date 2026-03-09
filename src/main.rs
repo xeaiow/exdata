@@ -95,6 +95,7 @@ async fn main() {
     });
     let ws_app = Router::new()
         .route("/ws/spreads", get(ws::ws_spreads))
+        .route("/ws/tickers", get(ws::ws_tickers))
         .with_state(ws_state);
 
     let app = rest_app.merge(ws_app);
