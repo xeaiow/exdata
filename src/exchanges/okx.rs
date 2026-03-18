@@ -243,7 +243,7 @@ async fn run_chunk(
                 tracing::info!("okx futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for bbo-tbt + tickers + funding-rate + books5 channels
+                // Build subscription args for bbo-tbt + tickers + funding-rate + books5 + mark-price + index-tickers channels
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
                 for inst_id in &symbols {
                     all_args.push(serde_json::json!({
@@ -261,6 +261,16 @@ async fn run_chunk(
                     all_args.push(serde_json::json!({
                         "channel": "books5",
                         "instId": inst_id
+                    }));
+                    all_args.push(serde_json::json!({
+                        "channel": "mark-price",
+                        "instId": inst_id
+                    }));
+                    // index-tickers uses spot-style instId: "BTC-USDT" (strip "-SWAP" suffix)
+                    let spot_inst_id = inst_id.strip_suffix("-SWAP").unwrap_or(inst_id);
+                    all_args.push(serde_json::json!({
+                        "channel": "index-tickers",
+                        "instId": spot_inst_id
                     }));
                 }
 
@@ -478,6 +488,49 @@ async fn run_chunk(
                                         item.rate_interval = Some(interval);
                                     }
                                     section.dirty = true;
+                                }
+                                "mark-price" => {
+                                    // OKX mark-price channel: { instId, markPx, ts }
+                                    let inst_id = data
+                                        .get("instId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&arg.inst_id);
+                                    let normalized = normalize_swap(inst_id);
+
+                                    if let Some(mark_px) = data.get("markPx").and_then(|v| v.as_str()) {
+                                        let mut section = cache.okx_future.write().await;
+                                        let item = section
+                                            .items
+                                            .entry(normalized.clone())
+                                            .or_insert_with(|| ExchangeItem {
+                                                name: normalized,
+                                                ..Default::default()
+                                            });
+                                        item.mark_price = Some(mark_px.to_string());
+                                        section.dirty = true;
+                                    }
+                                }
+                                "index-tickers" => {
+                                    // OKX index-tickers channel: { instId: "BTC-USDT", idxPx, ... }
+                                    let inst_id = data
+                                        .get("instId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&arg.inst_id);
+                                    // normalize_swap handles both "BTC-USDT-SWAP" and "BTC-USDT" → "BTCUSDT"
+                                    let normalized = normalize_swap(inst_id);
+
+                                    if let Some(idx_px) = data.get("idxPx").and_then(|v| v.as_str()) {
+                                        let mut section = cache.okx_future.write().await;
+                                        let item = section
+                                            .items
+                                            .entry(normalized.clone())
+                                            .or_insert_with(|| ExchangeItem {
+                                                name: normalized,
+                                                ..Default::default()
+                                            });
+                                        item.index_price = Some(idx_px.to_string());
+                                        section.dirty = true;
+                                    }
                                 }
                                 "books5" => {
                                     let inst_id = data
