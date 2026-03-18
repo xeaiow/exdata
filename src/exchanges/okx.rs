@@ -39,7 +39,7 @@ struct WsMsg {
 #[derive(Deserialize)]
 struct WsArg {
     channel: String,
-    #[serde(rename = "instId")]
+    #[serde(rename = "instId", default)]
     inst_id: String,
 }
 
@@ -243,8 +243,9 @@ async fn run_chunk(
                 tracing::info!("okx futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for bbo-tbt + tickers + funding-rate + books5 + mark-price + index-tickers channels
+                // Build subscription args: all per-symbol channels
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
+
                 for inst_id in &symbols {
                     all_args.push(serde_json::json!({
                         "channel": "bbo-tbt",
@@ -266,11 +267,11 @@ async fn run_chunk(
                         "channel": "mark-price",
                         "instId": inst_id
                     }));
-                    // index-tickers uses spot-style instId: "BTC-USDT" (strip "-SWAP" suffix)
-                    let spot_inst_id = inst_id.strip_suffix("-SWAP").unwrap_or(inst_id);
+                    // index-tickers uses spot-style instId (e.g. "BTC-USDT" not "BTC-USDT-SWAP")
+                    let spot_id = inst_id.strip_suffix("-SWAP").unwrap_or(inst_id);
                     all_args.push(serde_json::json!({
                         "channel": "index-tickers",
-                        "instId": spot_inst_id
+                        "instId": spot_id
                     }));
                 }
 
