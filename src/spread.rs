@@ -69,6 +69,10 @@ pub struct SpreadOpportunity {
     pub long_asks: Vec<PriceLevel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub short_bids: Vec<PriceLevel>,
+    pub long_mark_price: f64,
+    pub long_index_price: f64,
+    pub short_mark_price: f64,
+    pub short_index_price: f64,
     pub ts: u64,
     #[serde(rename = "depthTs", skip_serializing_if = "is_zero_u64")]
     pub depth_ts: u64,
@@ -97,6 +101,8 @@ pub struct SymbolTicker {
     pub volume_24h: f64,
     pub asks: Vec<crate::models::PriceLevel>,
     pub bids: Vec<crate::models::PriceLevel>,
+    pub mark_price: f64,
+    pub index_price: f64,
 }
 
 // ── Read tickers from cache ─────────────────────────────────────────────────
@@ -134,6 +140,10 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
                 volume_24h: item.trade24_count,
                 asks: item.asks.clone(),
                 bids: item.bids.clone(),
+                mark_price: item.mark_price.as_ref()
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
+                index_price: item.index_price.as_ref()
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
             });
         }
     }
@@ -231,6 +241,10 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                     },
                     long_asks: if depth_fresh { long.asks.clone() } else { Vec::new() },
                     short_bids: if depth_fresh { short.bids.clone() } else { Vec::new() },
+                    long_mark_price: long.mark_price,
+                    long_index_price: long.index_price,
+                    short_mark_price: short.mark_price,
+                    short_index_price: short.index_price,
                     ts,
                     depth_ts,
                 });
