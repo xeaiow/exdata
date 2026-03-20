@@ -250,7 +250,7 @@ pub async fn run_future(cache: SharedCache, client: reqwest::Client) {
 }
 
 /// Chunk worker: manages a single WS connection subscribing to ≤50 symbols.
-/// Subscribes to both futures.tickers and futures.book_ticker channels.
+/// Subscribes to futures.tickers and futures.order_book channels.
 /// Self-reconnects on disconnect; no refresh logic (coordinator handles that).
 async fn run_chunk(
     cache: SharedCache,
@@ -289,26 +289,6 @@ async fn run_chunk(
                     });
                     if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
                         tracing::error!("gate futures chunk-{}: tickers subscribe send error: {}", chunk_id, e);
-                        subscribe_failed = true;
-                    }
-                }
-
-                // Subscribe to futures.book_ticker
-                if !subscribe_failed {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let payload: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let sub = serde_json::json!({
-                        "time": now_secs,
-                        "channel": "futures.book_ticker",
-                        "event": "subscribe",
-                        "payload": payload
-                    });
-                    if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                        tracing::error!("gate futures chunk-{}: book_ticker subscribe send error: {}", chunk_id, e);
                         subscribe_failed = true;
                     }
                 }
@@ -480,65 +460,6 @@ async fn run_chunk(
                                     }
                                     section.dirty = true;
                                 }
-                                "futures.book_ticker" => {
-                                    let contract = result
-                                        .get("s")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    if contract.is_empty() {
-                                        continue;
-                                    }
-
-                                    let normalized = normalize_symbol(contract);
-                                    let symbol_for_event = normalized.clone();
-
-                                    let ask = result
-                                        .get("a")
-                                        .map(json_f64)
-                                        .unwrap_or(0.0);
-                                    let bid = result
-                                        .get("b")
-                                        .map(json_f64)
-                                        .unwrap_or(0.0);
-
-                                    let mut section = cache.gate_future.write().await;
-                                    section.ts = ts;
-
-                                    let item = section
-                                        .items
-                                        .entry(normalized.clone())
-                                        .or_insert_with(|| {
-                                            let mut ei = ExchangeItem {
-                                                name: normalized,
-                                                ..Default::default()
-                                            };
-                                            if let Some((interval, max_rate)) =
-                                                funding_info.get(contract)
-                                            {
-                                                ei.rate_interval = Some(*interval);
-                                                ei.rate_max = Some(max_rate.clone());
-                                            }
-                                            ei
-                                        });
-
-                                    item.a = ask;
-                                    item.b = bid;
-                                    item.ts = ts;
-
-                                    if item.rate_interval.is_none() {
-                                        if let Some((interval, max_rate)) =
-                                            funding_info.get(contract)
-                                        {
-                                            item.rate_interval = Some(*interval);
-                                            item.rate_max = Some(max_rate.clone());
-                                        }
-                                    }
-                                    section.dirty = true;
-                                    drop(section);
-                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                        symbol: symbol_for_event,
-                                    });
-                                }
                                 "futures.order_book" => {
                                     let contract = result
                                         .get("contract")
@@ -582,13 +503,29 @@ async fn run_chunk(
                                         let mut updated = false;
                                         {
                                             let mut section = cache.gate_future.write().await;
-                                            if let Some(item) = section.items.get_mut(&normalized) {
-                                                item.asks = asks;
-                                                item.bids = bids;
-                                                item.depth_ts = now_ms();
-                                                section.dirty = true;
-                                                updated = true;
-                                            }
+                                            let item = section
+                                                .items
+                                                .entry(normalized.clone())
+                                                .or_insert_with(|| {
+                                                    let mut ei = ExchangeItem {
+                                                        name: normalized.clone(),
+                                                        ..Default::default()
+                                                    };
+                                                    if let Some((interval, max_rate)) = funding_info.get(contract) {
+                                                        ei.rate_interval = Some(*interval);
+                                                        ei.rate_max = Some(max_rate.clone());
+                                                    }
+                                                    ei
+                                                });
+                                            item.asks = asks;
+                                            item.bids = bids;
+                                            item.depth_ts = now_ms();
+                                            // Derive BBO from depth best levels
+                                            if let Some(best) = item.asks.first() { item.a = best.price; }
+                                            if let Some(best) = item.bids.first() { item.b = best.price; }
+                                            item.ts = item.depth_ts;
+                                            section.dirty = true;
+                                            updated = true;
                                         }
                                         if updated {
                                             let now_inst = tokio::time::Instant::now();
