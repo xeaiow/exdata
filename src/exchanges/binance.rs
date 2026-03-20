@@ -79,8 +79,8 @@ async fn fetch_funding_info(
 }
 
 /// Fetch initial book ticker snapshot so every symbol has bid/ask from the start.
-/// The `!bookTicker` WebSocket stream is push-on-change only (no initial snapshot),
-/// so without this, illiquid symbols would stay at a=0 / b=0.
+/// The depth WebSocket stream may take a moment to deliver the first update,
+/// so without this, symbols would briefly stay at a=0 / b=0.
 async fn fetch_book_tickers(client: &reqwest::Client) -> Vec<RestBookTicker> {
     let url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker";
     let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {

@@ -546,7 +546,7 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
-                            // No TickerChanged here — BBO updates (orderbook.1) drive spread recalc
+                            // No TickerChanged here -- depth updates drive spread recalc
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
                             tracing::warn!("zoomex futures chunk-{}: no message for 30s, reconnecting", chunk_id);
