@@ -339,23 +339,6 @@ async fn run_chunk(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                // Subscribe orderbook.1 (BBO) in batches of 10
-                if !subscribe_failed {
-                    for chunk in symbols.chunks(10) {
-                        let args: Vec<String> =
-                            chunk.iter().map(|s| format!("orderbook.1.{}", s)).collect();
-                        let sub = serde_json::json!({
-                            "op": "subscribe",
-                            "args": args
-                        });
-                        if let Err(e) = write.send(Message::Text(sub.to_string().into())).await {
-                            tracing::error!("bybit futures chunk-{}: BBO subscribe send error: {}", chunk_id, e);
-                            subscribe_failed = true;
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
                 // Subscribe orderbook.50 (L2 depth) in separate batches of 10
                 if !subscribe_failed {
                     for chunk in symbols.chunks(10) {
@@ -433,59 +416,6 @@ async fn run_chunk(
                                 None => continue,
                             };
 
-                            if topic.starts_with("orderbook.1.") {
-                                // BBO stream: update bid/ask prices on every message (snapshot + delta)
-                                let symbol = topic.strip_prefix("orderbook.1.").unwrap_or("").to_string();
-                                if symbol.is_empty() {
-                                    continue;
-                                }
-
-                                let bid = data_val.get("b")
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|entry| entry.as_array())
-                                    .and_then(|pair| pair.first())
-                                    .and_then(|v| v.as_str())
-                                    .map(parse_f64)
-                                    .unwrap_or(0.0);
-                                let ask = data_val.get("a")
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|entry| entry.as_array())
-                                    .and_then(|pair| pair.first())
-                                    .and_then(|v| v.as_str())
-                                    .map(parse_f64)
-                                    .unwrap_or(0.0);
-
-                                if bid > 0.0 || ask > 0.0 {
-                                    let ts = ws_msg.ts.unwrap_or_else(now_ms);
-                                    let mut section = cache.bybit_future.write().await;
-                                    let item = section
-                                        .items
-                                        .entry(symbol.clone())
-                                        .or_insert_with(|| {
-                                            let mut ei = ExchangeItem {
-                                                name: symbol.clone(),
-                                                ..Default::default()
-                                            };
-                                            if let Some((interval, max_rate)) = funding_info.get(&symbol) {
-                                                ei.rate_interval = Some(*interval);
-                                                ei.rate_max = Some(max_rate.clone());
-                                            }
-                                            ei
-                                        });
-                                    if bid > 0.0 { item.b = bid; }
-                                    if ask > 0.0 { item.a = ask; }
-                                    item.ts = ts;
-                                    section.dirty = true;
-                                    drop(section);
-                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                        symbol: symbol.clone(),
-                                    });
-                                }
-                                continue;
-                            }
-
                             if topic.starts_with("orderbook.50.") {
                                 // Only process snapshot (ignore delta to avoid partial overwrites)
                                 if ws_msg.msg_type.as_deref() != Some("snapshot") {
@@ -523,13 +453,29 @@ async fn run_chunk(
                                     let mut updated = false;
                                     {
                                         let mut section = cache.bybit_future.write().await;
-                                        if let Some(item) = section.items.get_mut(&symbol) {
-                                            item.bids = bids;
-                                            item.asks = asks;
-                                            item.depth_ts = now_ms();
-                                            section.dirty = true;
-                                            updated = true;
-                                        }
+                                        let item = section
+                                            .items
+                                            .entry(symbol.clone())
+                                            .or_insert_with(|| {
+                                                let mut ei = ExchangeItem {
+                                                    name: symbol.clone(),
+                                                    ..Default::default()
+                                                };
+                                                if let Some((interval, max_rate)) = funding_info.get(&symbol) {
+                                                    ei.rate_interval = Some(*interval);
+                                                    ei.rate_max = Some(max_rate.clone());
+                                                }
+                                                ei
+                                            });
+                                        item.bids = bids;
+                                        item.asks = asks;
+                                        item.depth_ts = now_ms();
+                                        // Derive BBO from depth best levels
+                                        if let Some(best) = item.asks.first() { item.a = best.price; }
+                                        if let Some(best) = item.bids.first() { item.b = best.price; }
+                                        item.ts = item.depth_ts;
+                                        section.dirty = true;
+                                        updated = true;
                                     }
                                     if updated {
                                         let now_inst = tokio::time::Instant::now();
@@ -571,7 +517,7 @@ async fn run_chunk(
                                     ei
                                 });
 
-                            // bid/ask now driven by orderbook.1 BBO stream (not tickers)
+                            // bid/ask now driven by depth (orderbook.50) stream
                             if let Some(ref v) = ticker.turnover_24h {
                                 item.trade24_count = parse_f64(v);
                             }
@@ -594,7 +540,7 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
-                            // No TickerChanged here — BBO updates (orderbook.1) drive spread recalc
+                            // No TickerChanged here -- depth updates drive spread recalc
                             }
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
