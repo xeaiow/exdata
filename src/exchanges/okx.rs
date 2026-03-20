@@ -248,10 +248,6 @@ async fn run_chunk(
 
                 for inst_id in &symbols {
                     all_args.push(serde_json::json!({
-                        "channel": "bbo-tbt",
-                        "instId": inst_id
-                    }));
-                    all_args.push(serde_json::json!({
                         "channel": "tickers",
                         "instId": inst_id
                     }));
@@ -379,54 +375,8 @@ async fn run_chunk(
                             let ts = now_ms();
 
                             match channel {
-                                "bbo-tbt" => {
-                                    // BBO stream: update bid/ask prices
-                                    let inst_id = data
-                                        .get("instId")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&arg.inst_id);
-                                    let normalized = normalize_swap(inst_id);
-                                    let symbol_for_event = normalized.clone();
-
-                                    let ask_px = data.get("asks")
-                                        .and_then(|v| v.as_array())
-                                        .and_then(|arr| arr.first())
-                                        .and_then(|entry| entry.as_array())
-                                        .and_then(|pair| pair.first())
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| parse_f64(s))
-                                        .unwrap_or(0.0);
-                                    let bid_px = data.get("bids")
-                                        .and_then(|v| v.as_array())
-                                        .and_then(|arr| arr.first())
-                                        .and_then(|entry| entry.as_array())
-                                        .and_then(|pair| pair.first())
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| parse_f64(s))
-                                        .unwrap_or(0.0);
-
-                                    if bid_px > 0.0 || ask_px > 0.0 {
-                                        let mut section = cache.okx_future.write().await;
-                                        section.ts = ts;
-                                        let item = section
-                                            .items
-                                            .entry(normalized.clone())
-                                            .or_insert_with(|| ExchangeItem {
-                                                name: normalized,
-                                                ..Default::default()
-                                            });
-                                        if bid_px > 0.0 { item.b = bid_px; }
-                                        if ask_px > 0.0 { item.a = ask_px; }
-                                        item.ts = ts;
-                                        section.dirty = true;
-                                        drop(section);
-                                        let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                            symbol: symbol_for_event,
-                                        });
-                                    }
-                                }
                                 "tickers" => {
-                                    // bid/ask now driven by bbo-tbt stream (not tickers)
+                                    // bid/ask now driven by depth (books5) stream
                                     let inst_id = data
                                         .get("instId")
                                         .and_then(|v| v.as_str())
@@ -445,7 +395,7 @@ async fn run_chunk(
                                         });
                                     item.trade24_count = vol_ccy;
                                     section.dirty = true;
-                                    // No TickerChanged here — BBO updates (bbo-tbt) drive spread recalc
+                                    // No TickerChanged here -- depth updates drive spread recalc
                                 }
                                 "funding-rate" => {
                                     let inst_id = data
@@ -567,13 +517,22 @@ async fn run_chunk(
                                         let mut updated = false;
                                         {
                                             let mut section = cache.okx_future.write().await;
-                                            if let Some(item) = section.items.get_mut(&normalized) {
-                                                item.asks = asks;
-                                                item.bids = bids;
-                                                item.depth_ts = now_ms();
-                                                section.dirty = true;
-                                                updated = true;
-                                            }
+                                            let item = section
+                                                .items
+                                                .entry(normalized.clone())
+                                                .or_insert_with(|| ExchangeItem {
+                                                    name: normalized.clone(),
+                                                    ..Default::default()
+                                                });
+                                            item.asks = asks;
+                                            item.bids = bids;
+                                            item.depth_ts = now_ms();
+                                            // Derive BBO from depth best levels
+                                            if let Some(best) = item.asks.first() { item.a = best.price; }
+                                            if let Some(best) = item.bids.first() { item.b = best.price; }
+                                            item.ts = item.depth_ts;
+                                            section.dirty = true;
+                                            updated = true;
                                         }
                                         if updated {
                                             let now_inst = tokio::time::Instant::now();
