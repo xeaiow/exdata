@@ -476,7 +476,6 @@ async fn run_chunk(
                                 let bids = parse_levels("bids");
 
                                 if !asks.is_empty() || !bids.is_empty() {
-                                    let mut updated = false;
                                     let inst_id_owned = inst_id.to_string();
                                     {
                                         let mut section = cache.bitget_future.write().await;
@@ -502,9 +501,8 @@ async fn run_chunk(
                                         if let Some(best) = item.bids.first() { item.b = best.price; }
                                         item.ts = item.depth_ts;
                                         section.dirty = true;
-                                        updated = true;
                                     }
-                                    if updated {
+                                    {
                                         let now_inst = tokio::time::Instant::now();
                                         let should_fire = depth_throttle.get(&inst_id_owned)
                                             .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));

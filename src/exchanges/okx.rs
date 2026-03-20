@@ -514,7 +514,6 @@ async fn run_chunk(
                                     let bids = parse_levels("bids");
 
                                     if !asks.is_empty() || !bids.is_empty() {
-                                        let mut updated = false;
                                         {
                                             let mut section = cache.okx_future.write().await;
                                             let item = section
@@ -532,9 +531,8 @@ async fn run_chunk(
                                             if let Some(best) = item.bids.first() { item.b = best.price; }
                                             item.ts = item.depth_ts;
                                             section.dirty = true;
-                                            updated = true;
                                         }
-                                        if updated {
+                                        {
                                             let now_inst = tokio::time::Instant::now();
                                             let should_fire = depth_throttle.get(&normalized)
                                                 .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));
