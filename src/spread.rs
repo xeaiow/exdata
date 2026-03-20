@@ -289,16 +289,6 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 /// across all symbols so that downstream consumers never starve for data.
 ///
 /// Throttle: max once per 500ms per pair.
-struct SpreadConfirmState {
-    first_seen_ms: u64,
-    confirmed: bool,
-}
-
-/// Spread stability confirmation: high spreads (≥ SPREAD_CONFIRM_THRESHOLD)
-/// must persist for at least SPREAD_CONFIRM_DURATION_MS before being emitted,
-/// filtering out short-lived BBO spikes from low-liquidity exchanges.
-const SPREAD_CONFIRM_THRESHOLD: f64 = 0.3;
-const SPREAD_CONFIRM_DURATION_MS: u64 = 3000;
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -537,12 +527,6 @@ pub async fn run_spread_calculator(
     let mut last_sent: std::collections::HashMap<(String, &'static str, &'static str), u64> =
         std::collections::HashMap::new();
 
-    // Spread stability confirmation state
-    let mut confirm_state: std::collections::HashMap<
-        (String, &'static str, &'static str),
-        SpreadConfirmState,
-    > = std::collections::HashMap::new();
-
     loop {
         // Wait for the first ticker change event (zero-latency wakeup)
         let mut changed = HashSet::new();
@@ -599,27 +583,6 @@ pub async fn run_spread_calculator(
                     opp.long_exchange,
                     opp.short_exchange,
                 );
-
-                let is_high_spread = opp.spread_percent.abs() >= SPREAD_CONFIRM_THRESHOLD;
-
-                if is_high_spread {
-                    let state = confirm_state.entry(key.clone()).or_insert(SpreadConfirmState {
-                        first_seen_ms: now,
-                        confirmed: false,
-                    });
-
-                    if !state.confirmed {
-                        if now.saturating_sub(state.first_seen_ms) >= SPREAD_CONFIRM_DURATION_MS {
-                            state.confirmed = true;
-                        } else {
-                            // Not yet confirmed — skip sending
-                            continue;
-                        }
-                    }
-                } else {
-                    // Spread dropped below threshold — reset confirmation
-                    confirm_state.remove(&key);
-                }
 
                 // Throttle: max once per 500ms per pair
                 let should_send = match last_sent.get(&key) {
