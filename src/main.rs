@@ -4,7 +4,6 @@ mod config;
 mod exchanges;
 mod models;
 mod recorder;
-mod validator;
 mod spread;
 mod ws;
 
@@ -28,11 +27,6 @@ async fn main() {
     tokio::spawn(exchanges::gate::run_future(cache.clone(), client.clone()));
     tokio::spawn(exchanges::bitget::run_future(cache.clone(), client.clone()));
     tokio::spawn(exchanges::zoomex::run_future(cache.clone(), client.clone()));
-
-    // Spawn validator if configured
-    if let Some(validator_config) = config::load_validator_config() {
-        tokio::spawn(validator::run(cache.clone(), client.clone(), validator_config));
-    }
 
     // Spawn recorder if configured
     if let Some(recorder_config) = config::load_recorder_config() {

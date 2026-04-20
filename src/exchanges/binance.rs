@@ -15,13 +15,6 @@ struct CombinedMsg {
 }
 
 #[derive(Deserialize)]
-struct FuturesBookTicker {
-    s: String,
-    a: String,
-    b: String,
-}
-
-#[derive(Deserialize)]
 struct FuturesTicker {
     s: String,
     q: String,
@@ -86,8 +79,8 @@ async fn fetch_funding_info(
 }
 
 /// Fetch initial book ticker snapshot so every symbol has bid/ask from the start.
-/// The `!bookTicker` WebSocket stream is push-on-change only (no initial snapshot),
-/// so without this, illiquid symbols would stay at a=0 / b=0.
+/// The depth WebSocket stream may take a moment to deliver the first update,
+/// so without this, symbols would briefly stay at a=0 / b=0.
 async fn fetch_book_tickers(client: &reqwest::Client) -> Vec<RestBookTicker> {
     let url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker";
     let resp = match client.get(url).timeout(std::time::Duration::from_secs(10)).send().await {
@@ -242,7 +235,7 @@ async fn run_chunk(
             .map(|s| format!("{}@depth20@500ms", s.to_lowercase()))
             .collect();
         let url = format!(
-            "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/!bookTicker/{}",
+            "wss://fstream.binance.com/stream?streams=!ticker@arr/!markPrice@arr@1s/{}",
             depth_streams.join("/")
         );
         let ws_result = tokio::time::timeout(
@@ -303,39 +296,7 @@ async fn run_chunk(
                             let stream = combined.stream.as_str();
                             let ts = now_ms();
 
-                            if stream == "!bookTicker" {
-                                let bt: FuturesBookTicker = match serde_json::from_value(combined.data) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::warn!("binance futures chunk-{}: parse bookTicker error: {}", chunk_id, e);
-                                        continue;
-                                    }
-                                };
-                                if !valid_set.contains(&bt.s) {
-                                    continue;
-                                }
-                                let mut section = cache.binance_future.write().await;
-                                section.ts = ts;
-                                let item = section
-                                    .items
-                                    .entry(bt.s.clone())
-                                    .or_insert_with(|| ExchangeItem {
-                                        name: bt.s.clone(),
-                                        ..Default::default()
-                                    });
-                                item.a = parse_f64(&bt.a);
-                                item.b = parse_f64(&bt.b);
-                                item.ts = ts;
-                                if let Some((interval, max_rate)) = funding_info.get(&bt.s) {
-                                    item.rate_interval = Some(*interval);
-                                    item.rate_max = Some(max_rate.clone());
-                                }
-                                section.dirty = true;
-                                drop(section);
-                                let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                    symbol: bt.s.clone(),
-                                });
-                            } else if stream == "!ticker@arr" {
+                            if stream == "!ticker@arr" {
                                 let tickers: Vec<FuturesTicker> =
                                     match serde_json::from_value(combined.data) {
                                         Ok(v) => v,
@@ -433,22 +394,36 @@ async fn run_chunk(
                                         .collect()
                                 };
 
-                                let mut updated = false;
                                 {
                                     let mut section = cache.binance_future.write().await;
-                                    if let Some(item) = section.items.get_mut(&sym_upper) {
-                                        if let Some(b) = bids_raw {
-                                            item.bids = parse_levels(b);
-                                        }
-                                        if let Some(a) = asks_raw {
-                                            item.asks = parse_levels(a);
-                                        }
-                                        item.depth_ts = ts;
-                                        section.dirty = true;
-                                        updated = true;
+                                    let item = section
+                                        .items
+                                        .entry(sym_upper.clone())
+                                        .or_insert_with(|| {
+                                            let mut ei = ExchangeItem {
+                                                name: sym_upper.clone(),
+                                                ..Default::default()
+                                            };
+                                            if let Some((interval, max_rate)) = funding_info.get(&sym_upper) {
+                                                ei.rate_interval = Some(*interval);
+                                                ei.rate_max = Some(max_rate.clone());
+                                            }
+                                            ei
+                                        });
+                                    if let Some(b) = bids_raw {
+                                        item.bids = parse_levels(b);
                                     }
+                                    if let Some(a) = asks_raw {
+                                        item.asks = parse_levels(a);
+                                    }
+                                    item.depth_ts = ts;
+                                    // Derive BBO from depth best levels
+                                    if let Some(best) = item.asks.first() { item.a = best.price; }
+                                    if let Some(best) = item.bids.first() { item.b = best.price; }
+                                    item.ts = ts;
+                                    section.dirty = true;
                                 }
-                                if updated {
+                                {
                                     let now_inst = tokio::time::Instant::now();
                                     let should_fire = depth_throttle.get(&sym_upper)
                                         .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));

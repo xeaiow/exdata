@@ -69,6 +69,10 @@ pub struct SpreadOpportunity {
     pub long_asks: Vec<PriceLevel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub short_bids: Vec<PriceLevel>,
+    pub long_mark_price: f64,
+    pub long_index_price: f64,
+    pub short_mark_price: f64,
+    pub short_index_price: f64,
     pub ts: u64,
     #[serde(rename = "depthTs", skip_serializing_if = "is_zero_u64")]
     pub depth_ts: u64,
@@ -97,6 +101,8 @@ pub struct SymbolTicker {
     pub volume_24h: f64,
     pub asks: Vec<crate::models::PriceLevel>,
     pub bids: Vec<crate::models::PriceLevel>,
+    pub mark_price: f64,
+    pub index_price: f64,
 }
 
 // ── Read tickers from cache ─────────────────────────────────────────────────
@@ -134,6 +140,10 @@ pub async fn read_symbol_tickers(cache: &SharedCache, symbol: &str) -> Vec<Symbo
                 volume_24h: item.trade24_count,
                 asks: item.asks.clone(),
                 bids: item.bids.clone(),
+                mark_price: item.mark_price.as_ref()
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
+                index_price: item.index_price.as_ref()
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
             });
         }
     }
@@ -231,6 +241,10 @@ pub fn compute_spreads(symbol: &str, tickers: &[SymbolTicker]) -> Vec<SpreadOppo
                     },
                     long_asks: if depth_fresh { long.asks.clone() } else { Vec::new() },
                     short_bids: if depth_fresh { short.bids.clone() } else { Vec::new() },
+                    long_mark_price: long.mark_price,
+                    long_index_price: long.index_price,
+                    short_mark_price: short.mark_price,
+                    short_index_price: short.index_price,
                     ts,
                     depth_ts,
                 });
@@ -275,6 +289,235 @@ pub async fn collect_all_symbols(cache: &SharedCache) -> Vec<String> {
 /// across all symbols so that downstream consumers never starve for data.
 ///
 /// Throttle: max once per 500ms per pair.
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ExchangeItem;
+
+    fn make_ticker(
+        exchange: ExchangeName,
+        ask: f64,
+        bid: f64,
+        mark_price: f64,
+        index_price: f64,
+    ) -> SymbolTicker {
+        let now = crate::exchanges::now_ms();
+        SymbolTicker {
+            exchange,
+            ask,
+            bid,
+            ts: now,
+            depth_ts: 0,
+            volume_24h: 1_000_000.0,
+            asks: Vec::new(),
+            bids: Vec::new(),
+            mark_price,
+            index_price,
+        }
+    }
+
+    // ── compute_spreads: mark/index price passthrough ─────────────────────
+
+    #[test]
+    fn compute_spreads_passes_through_mark_index_prices() {
+        let tickers = vec![
+            make_ticker(ExchangeName::Binance, 100.5, 100.0, 100.3, 100.1),
+            make_ticker(ExchangeName::Okx, 100.8, 100.2, 100.6, 100.2),
+        ];
+
+        let results = compute_spreads("BTCUSDT", &tickers);
+        assert_eq!(results.len(), 2, "should produce 2 directions");
+
+        // Find binance-long / okx-short direction
+        let binance_long = results.iter().find(|o| o.long_exchange == "binance").unwrap();
+        assert_eq!(binance_long.long_mark_price, 100.3);
+        assert_eq!(binance_long.long_index_price, 100.1);
+        assert_eq!(binance_long.short_mark_price, 100.6);
+        assert_eq!(binance_long.short_index_price, 100.2);
+
+        // Find okx-long / binance-short direction
+        let okx_long = results.iter().find(|o| o.long_exchange == "okx").unwrap();
+        assert_eq!(okx_long.long_mark_price, 100.6);
+        assert_eq!(okx_long.long_index_price, 100.2);
+        assert_eq!(okx_long.short_mark_price, 100.3);
+        assert_eq!(okx_long.short_index_price, 100.1);
+    }
+
+    #[test]
+    fn compute_spreads_zero_mark_index_passes_through() {
+        // When mark/index prices are 0 (unavailable), they should still be passed through as 0
+        let tickers = vec![
+            make_ticker(ExchangeName::Binance, 50.0, 49.8, 0.0, 0.0),
+            make_ticker(ExchangeName::Bybit, 50.1, 49.9, 50.05, 50.0),
+        ];
+
+        let results = compute_spreads("ETHUSDT", &tickers);
+        let binance_long = results.iter().find(|o| o.long_exchange == "binance").unwrap();
+        assert_eq!(binance_long.long_mark_price, 0.0);
+        assert_eq!(binance_long.long_index_price, 0.0);
+        assert_eq!(binance_long.short_mark_price, 50.05);
+        assert_eq!(binance_long.short_index_price, 50.0);
+    }
+
+    #[test]
+    fn compute_spreads_three_exchanges_produces_six_results() {
+        let tickers = vec![
+            make_ticker(ExchangeName::Binance, 100.0, 99.8, 99.9, 99.85),
+            make_ticker(ExchangeName::Okx, 100.1, 99.9, 100.0, 99.95),
+            make_ticker(ExchangeName::Bybit, 100.2, 100.0, 100.1, 100.05),
+        ];
+
+        let results = compute_spreads("SOLUSDT", &tickers);
+        // 3 pairs × 2 directions = 6
+        assert_eq!(results.len(), 6);
+
+        // Every result should have non-zero mark/index prices
+        for opp in &results {
+            assert!(opp.long_mark_price > 0.0, "long_mark_price should be set for {}-{}", opp.long_exchange, opp.short_exchange);
+            assert!(opp.long_index_price > 0.0, "long_index_price should be set");
+            assert!(opp.short_mark_price > 0.0, "short_mark_price should be set");
+            assert!(opp.short_index_price > 0.0, "short_index_price should be set");
+        }
+    }
+
+    // ── read_symbol_tickers: ExchangeItem → SymbolTicker parsing ─────────
+
+    #[tokio::test]
+    async fn read_symbol_tickers_parses_mark_index_from_cache() {
+        let (ticker_tx, _) = tokio::sync::broadcast::channel::<TickerChanged>(16);
+        let cache: SharedCache = std::sync::Arc::new(crate::cache::Cache::new(ticker_tx));
+        let now = crate::exchanges::now_ms();
+
+        // Insert an item with mark/index price into binance cache
+        {
+            let mut section = cache.binance_future.write().await;
+            section.items.insert("BTCUSDT".to_string(), ExchangeItem {
+                name: "BTCUSDT".to_string(),
+                ts: now,
+                a: 84000.0,
+                b: 83990.0,
+                mark_price: Some("84005.50".to_string()),
+                index_price: Some("84010.25".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let tickers = read_symbol_tickers(&cache, "BTCUSDT").await;
+        assert_eq!(tickers.len(), 1);
+        assert_eq!(tickers[0].mark_price, 84005.50);
+        assert_eq!(tickers[0].index_price, 84010.25);
+    }
+
+    #[tokio::test]
+    async fn read_symbol_tickers_returns_zero_for_missing_mark_index() {
+        let (ticker_tx, _) = tokio::sync::broadcast::channel::<TickerChanged>(16);
+        let cache: SharedCache = std::sync::Arc::new(crate::cache::Cache::new(ticker_tx));
+        let now = crate::exchanges::now_ms();
+
+        // Insert item without mark/index price
+        {
+            let mut section = cache.okx_future.write().await;
+            section.items.insert("ETHUSDT".to_string(), ExchangeItem {
+                name: "ETHUSDT".to_string(),
+                ts: now,
+                a: 3000.0,
+                b: 2999.0,
+                mark_price: None,
+                index_price: None,
+                ..Default::default()
+            });
+        }
+
+        let tickers = read_symbol_tickers(&cache, "ETHUSDT").await;
+        assert_eq!(tickers.len(), 1);
+        assert_eq!(tickers[0].mark_price, 0.0);
+        assert_eq!(tickers[0].index_price, 0.0);
+    }
+
+    #[tokio::test]
+    async fn read_symbol_tickers_handles_invalid_price_strings() {
+        let (ticker_tx, _) = tokio::sync::broadcast::channel::<TickerChanged>(16);
+        let cache: SharedCache = std::sync::Arc::new(crate::cache::Cache::new(ticker_tx));
+        let now = crate::exchanges::now_ms();
+
+        {
+            let mut section = cache.bybit_future.write().await;
+            section.items.insert("XRPUSDT".to_string(), ExchangeItem {
+                name: "XRPUSDT".to_string(),
+                ts: now,
+                a: 0.5,
+                b: 0.49,
+                mark_price: Some("not_a_number".to_string()),
+                index_price: Some("".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let tickers = read_symbol_tickers(&cache, "XRPUSDT").await;
+        assert_eq!(tickers.len(), 1);
+        assert_eq!(tickers[0].mark_price, 0.0, "invalid string should parse as 0.0");
+        assert_eq!(tickers[0].index_price, 0.0, "empty string should parse as 0.0");
+    }
+
+    // ── End-to-end: cache → tickers → compute_spreads ────────────────────
+
+    #[tokio::test]
+    async fn end_to_end_mark_index_through_spread_pipeline() {
+        let (ticker_tx, _) = tokio::sync::broadcast::channel::<TickerChanged>(16);
+        let cache: SharedCache = std::sync::Arc::new(crate::cache::Cache::new(ticker_tx));
+        let now = crate::exchanges::now_ms();
+
+        // Simulate two exchanges with different mark/index prices (PI divergence scenario)
+        {
+            let mut section = cache.binance_future.write().await;
+            section.items.insert("SOLUSDT".to_string(), ExchangeItem {
+                name: "SOLUSDT".to_string(),
+                ts: now,
+                a: 120.5,
+                b: 120.3,
+                mark_price: Some("120.45".to_string()),   // PI = (120.45 - 120.40) / 120.40 = +0.0415%
+                index_price: Some("120.40".to_string()),
+                ..Default::default()
+            });
+        }
+        {
+            let mut section = cache.okx_future.write().await;
+            section.items.insert("SOLUSDT".to_string(), ExchangeItem {
+                name: "SOLUSDT".to_string(),
+                ts: now,
+                a: 120.6,
+                b: 120.4,
+                mark_price: Some("120.30".to_string()),   // PI = (120.30 - 120.40) / 120.40 = -0.0831%
+                index_price: Some("120.40".to_string()),
+                ..Default::default()
+            });
+        }
+
+        // Read tickers from cache
+        let tickers = read_symbol_tickers(&cache, "SOLUSDT").await;
+        assert_eq!(tickers.len(), 2);
+
+        // Compute spreads
+        let opps = compute_spreads("SOLUSDT", &tickers);
+        assert!(opps.len() >= 2);
+
+        // Verify PI divergence can be calculated from the output
+        let opp = &opps[0];
+        let long_pi = (opp.long_mark_price - opp.long_index_price) / opp.long_index_price;
+        let short_pi = (opp.short_mark_price - opp.short_index_price) / opp.short_index_price;
+        let divergence = (long_pi - short_pi).abs() * 100.0;
+
+        assert!(opp.long_mark_price > 0.0, "long_mark_price should be populated");
+        assert!(opp.long_index_price > 0.0, "long_index_price should be populated");
+        assert!(opp.short_mark_price > 0.0, "short_mark_price should be populated");
+        assert!(opp.short_index_price > 0.0, "short_index_price should be populated");
+        assert!(divergence > 0.0, "divergence should be non-zero when mark prices differ");
+    }
+}
+
 pub async fn run_spread_calculator(
     cache: SharedCache,
     mut ticker_rx: tokio::sync::broadcast::Receiver<TickerChanged>,

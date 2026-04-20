@@ -52,10 +52,6 @@ struct WsMsg {
 #[derive(Deserialize)]
 struct TickerData {
     symbol: String,
-    #[serde(rename = "ask1Price", default)]
-    ask1_price: Option<String>,
-    #[serde(rename = "bid1Price", default)]
-    bid1_price: Option<String>,
     #[serde(rename = "turnover24h", default)]
     turnover_24h: Option<String>,
     #[serde(rename = "fundingRate", default)]
@@ -343,7 +339,7 @@ async fn run_chunk(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                // Subscribe orderbook.50 in separate batches of 10
+                // Subscribe orderbook.50 (L2 depth) in separate batches of 10
                 if !subscribe_failed {
                     for chunk in symbols.chunks(10) {
                         let args: Vec<String> =
@@ -454,18 +450,32 @@ async fn run_chunk(
                                 let asks = parse_levels("a");
 
                                 if !bids.is_empty() || !asks.is_empty() {
-                                    let mut updated = false;
                                     {
                                         let mut section = cache.bybit_future.write().await;
-                                        if let Some(item) = section.items.get_mut(&symbol) {
-                                            item.bids = bids;
-                                            item.asks = asks;
-                                            item.depth_ts = now_ms();
-                                            section.dirty = true;
-                                            updated = true;
-                                        }
+                                        let item = section
+                                            .items
+                                            .entry(symbol.clone())
+                                            .or_insert_with(|| {
+                                                let mut ei = ExchangeItem {
+                                                    name: symbol.clone(),
+                                                    ..Default::default()
+                                                };
+                                                if let Some((interval, max_rate)) = funding_info.get(&symbol) {
+                                                    ei.rate_interval = Some(*interval);
+                                                    ei.rate_max = Some(max_rate.clone());
+                                                }
+                                                ei
+                                            });
+                                        item.bids = bids;
+                                        item.asks = asks;
+                                        item.depth_ts = now_ms();
+                                        // Derive BBO from depth best levels
+                                        if let Some(best) = item.asks.first() { item.a = best.price; }
+                                        if let Some(best) = item.bids.first() { item.b = best.price; }
+                                        item.ts = item.depth_ts;
+                                        section.dirty = true;
                                     }
-                                    if updated {
+                                    {
                                         let now_inst = tokio::time::Instant::now();
                                         let should_fire = depth_throttle.get(&symbol)
                                             .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));
@@ -505,15 +515,7 @@ async fn run_chunk(
                                     ei
                                 });
 
-                            // Delta messages only have partial fields; only update what's present
-                            if let Some(ref v) = ticker.ask1_price {
-                                item.a = parse_f64(v);
-                                item.ts = ts;
-                            }
-                            if let Some(ref v) = ticker.bid1_price {
-                                item.b = parse_f64(v);
-                                item.ts = ts;
-                            }
+                            // bid/ask now driven by depth (orderbook.50) stream
                             if let Some(ref v) = ticker.turnover_24h {
                                 item.trade24_count = parse_f64(v);
                             }
@@ -536,10 +538,7 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
-                            drop(section);
-                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                symbol: ticker.symbol.clone(),
-                            });
+                            // No TickerChanged here -- depth updates drive spread recalc
                             }
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {

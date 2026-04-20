@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -19,40 +19,22 @@ pub struct WsState {
 
 pub type SharedWsState = Arc<WsState>;
 
-fn default_min_spread() -> f64 {
-    f64::NEG_INFINITY
-}
-
-#[derive(Deserialize)]
-pub(crate) struct WsQuery {
-    #[serde(default = "default_min_spread")]
-    min_spread: f64,
-}
-
 /// Axum handler: upgrade HTTP -> WebSocket.
 pub async fn ws_spreads(
     ws: WebSocketUpgrade,
     State(state): State<SharedWsState>,
-    Query(query): Query<WsQuery>,
 ) -> Response {
-    let min_spread = query.min_spread;
-    ws.on_upgrade(move |socket| handle_ws(socket, state, min_spread))
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-async fn handle_ws(mut socket: WebSocket, state: SharedWsState, min_spread: f64) {
-    tracing::info!("ws/spreads: client connected (min_spread={})", min_spread);
+async fn handle_ws(mut socket: WebSocket, state: SharedWsState) {
+    tracing::info!("ws/spreads: client connected");
 
     // Subscribe before snapshot so updates during snapshot computation are buffered.
     let mut spread_rx = state.spread_tx.subscribe();
 
-    // Compute and send initial snapshot (filtered by min_spread)
-    let snapshot = build_snapshot(&state.cache, min_spread).await;
-
-    // Track which pairs have been sent to this client (for threshold-crossing detection)
-    let mut sent_pairs: HashSet<(String, &'static str, &'static str)> = HashSet::new();
-    for opp in &snapshot {
-        sent_pairs.insert((opp.symbol.clone(), opp.long_exchange, opp.short_exchange));
-    }
+    // Compute and send initial snapshot (all pairs, both directions)
+    let snapshot = build_snapshot(&state.cache).await;
 
     let msg = SpreadMessage::Snapshot { data: snapshot };
     let json = match serde_json::to_string(&msg) {
@@ -122,11 +104,7 @@ async fn handle_ws(mut socket: WebSocket, state: SharedWsState, min_spread: f64)
 
                 // If lagged, send full snapshot
                 if need_snapshot {
-                    let snapshot = build_snapshot(&state.cache, min_spread).await;
-                    sent_pairs.clear();
-                    for opp in &snapshot {
-                        sent_pairs.insert((opp.symbol.clone(), opp.long_exchange, opp.short_exchange));
-                    }
+                    let snapshot = build_snapshot(&state.cache).await;
                     let msg = SpreadMessage::Snapshot { data: snapshot };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         if socket.send(Message::Text(Utf8Bytes::from(json))).await.is_err() {
@@ -136,16 +114,8 @@ async fn handle_ws(mut socket: WebSocket, state: SharedWsState, min_spread: f64)
                     continue;
                 }
 
-                // Filter by min_spread and track threshold crossings
-                let mut to_send: Vec<SpreadOpportunity> = Vec::new();
-                for (key, opp) in pending {
-                    if opp.spread_percent >= min_spread {
-                        sent_pairs.insert(key);
-                        to_send.push(opp);
-                    } else if sent_pairs.remove(&key) {
-                        to_send.push(opp);
-                    }
-                }
+                // Send all pairs (entry score combines spread + funding, so negative spread may still be profitable)
+                let to_send: Vec<SpreadOpportunity> = pending.into_values().collect();
 
                 // Send batch
                 if !to_send.is_empty() {
@@ -405,8 +375,8 @@ async fn build_ticker_update(
     })
 }
 
-/// Build a full snapshot of all current spread opportunities filtered by min_spread.
-async fn build_snapshot(cache: &SharedCache, min_spread: f64) -> Vec<SpreadOpportunity> {
+/// Build a full snapshot of all current spread opportunities.
+async fn build_snapshot(cache: &SharedCache) -> Vec<SpreadOpportunity> {
     let symbols = spread::collect_all_symbols(cache).await;
     let mut all_opps = Vec::new();
 
@@ -415,12 +385,7 @@ async fn build_snapshot(cache: &SharedCache, min_spread: f64) -> Vec<SpreadOppor
         if tickers.len() < 2 {
             continue;
         }
-        let opps = spread::compute_spreads(symbol, &tickers);
-        for opp in opps {
-            if opp.spread_percent >= min_spread {
-                all_opps.push(opp);
-            }
-        }
+        all_opps.extend(spread::compute_spreads(symbol, &tickers));
     }
 
     all_opps

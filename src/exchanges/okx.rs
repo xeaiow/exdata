@@ -39,7 +39,7 @@ struct WsMsg {
 #[derive(Deserialize)]
 struct WsArg {
     channel: String,
-    #[serde(rename = "instId")]
+    #[serde(rename = "instId", default)]
     inst_id: String,
 }
 
@@ -243,8 +243,9 @@ async fn run_chunk(
                 tracing::info!("okx futures chunk-{}: connected", chunk_id);
                 let (mut write, mut read) = ws.split();
 
-                // Build subscription args for tickers + funding-rate + books5 channels
+                // Build subscription args: all per-symbol channels
                 let mut all_args: Vec<serde_json::Value> = Vec::new();
+
                 for inst_id in &symbols {
                     all_args.push(serde_json::json!({
                         "channel": "tickers",
@@ -257,6 +258,16 @@ async fn run_chunk(
                     all_args.push(serde_json::json!({
                         "channel": "books5",
                         "instId": inst_id
+                    }));
+                    all_args.push(serde_json::json!({
+                        "channel": "mark-price",
+                        "instId": inst_id
+                    }));
+                    // index-tickers uses spot-style instId (e.g. "BTC-USDT" not "BTC-USDT-SWAP")
+                    let spot_id = inst_id.strip_suffix("-SWAP").unwrap_or(inst_id);
+                    all_args.push(serde_json::json!({
+                        "channel": "index-tickers",
+                        "instId": spot_id
                     }));
                 }
 
@@ -365,19 +376,16 @@ async fn run_chunk(
 
                             match channel {
                                 "tickers" => {
+                                    // bid/ask now driven by depth (books5) stream
                                     let inst_id = data
                                         .get("instId")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or(&arg.inst_id);
                                     let normalized = normalize_swap(inst_id);
-                                    let symbol_for_event = normalized.clone();
 
-                                    let ask_px = data.get("askPx").map(json_f64).unwrap_or(0.0);
-                                    let bid_px = data.get("bidPx").map(json_f64).unwrap_or(0.0);
                                     let vol_ccy = data.get("volCcy24h").map(json_f64).unwrap_or(0.0);
 
                                     let mut section = cache.okx_future.write().await;
-                                    section.ts = ts;
                                     let item = section
                                         .items
                                         .entry(normalized.clone())
@@ -385,15 +393,9 @@ async fn run_chunk(
                                             name: normalized,
                                             ..Default::default()
                                         });
-                                    item.a = ask_px;
-                                    item.b = bid_px;
-                                    item.ts = ts;
                                     item.trade24_count = vol_ccy;
                                     section.dirty = true;
-                                    drop(section);
-                                    let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                        symbol: symbol_for_event,
-                                    });
+                                    // No TickerChanged here -- depth updates drive spread recalc
                                 }
                                 "funding-rate" => {
                                     let inst_id = data
@@ -438,6 +440,49 @@ async fn run_chunk(
                                     }
                                     section.dirty = true;
                                 }
+                                "mark-price" => {
+                                    // OKX mark-price channel: { instId, markPx, ts }
+                                    let inst_id = data
+                                        .get("instId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&arg.inst_id);
+                                    let normalized = normalize_swap(inst_id);
+
+                                    if let Some(mark_px) = data.get("markPx").and_then(|v| v.as_str()) {
+                                        let mut section = cache.okx_future.write().await;
+                                        let item = section
+                                            .items
+                                            .entry(normalized.clone())
+                                            .or_insert_with(|| ExchangeItem {
+                                                name: normalized,
+                                                ..Default::default()
+                                            });
+                                        item.mark_price = Some(mark_px.to_string());
+                                        section.dirty = true;
+                                    }
+                                }
+                                "index-tickers" => {
+                                    // OKX index-tickers channel: { instId: "BTC-USDT", idxPx, ... }
+                                    let inst_id = data
+                                        .get("instId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&arg.inst_id);
+                                    // normalize_swap handles both "BTC-USDT-SWAP" and "BTC-USDT" → "BTCUSDT"
+                                    let normalized = normalize_swap(inst_id);
+
+                                    if let Some(idx_px) = data.get("idxPx").and_then(|v| v.as_str()) {
+                                        let mut section = cache.okx_future.write().await;
+                                        let item = section
+                                            .items
+                                            .entry(normalized.clone())
+                                            .or_insert_with(|| ExchangeItem {
+                                                name: normalized,
+                                                ..Default::default()
+                                            });
+                                        item.index_price = Some(idx_px.to_string());
+                                        section.dirty = true;
+                                    }
+                                }
                                 "books5" => {
                                     let inst_id = data
                                         .get("instId")
@@ -469,18 +514,25 @@ async fn run_chunk(
                                     let bids = parse_levels("bids");
 
                                     if !asks.is_empty() || !bids.is_empty() {
-                                        let mut updated = false;
                                         {
                                             let mut section = cache.okx_future.write().await;
-                                            if let Some(item) = section.items.get_mut(&normalized) {
-                                                item.asks = asks;
-                                                item.bids = bids;
-                                                item.depth_ts = now_ms();
-                                                section.dirty = true;
-                                                updated = true;
-                                            }
+                                            let item = section
+                                                .items
+                                                .entry(normalized.clone())
+                                                .or_insert_with(|| ExchangeItem {
+                                                    name: normalized.clone(),
+                                                    ..Default::default()
+                                                });
+                                            item.asks = asks;
+                                            item.bids = bids;
+                                            item.depth_ts = now_ms();
+                                            // Derive BBO from depth best levels
+                                            if let Some(best) = item.asks.first() { item.a = best.price; }
+                                            if let Some(best) = item.bids.first() { item.b = best.price; }
+                                            item.ts = item.depth_ts;
+                                            section.dirty = true;
                                         }
-                                        if updated {
+                                        {
                                             let now_inst = tokio::time::Instant::now();
                                             let should_fire = depth_throttle.get(&normalized)
                                                 .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));

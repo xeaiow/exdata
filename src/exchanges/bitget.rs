@@ -476,19 +476,33 @@ async fn run_chunk(
                                 let bids = parse_levels("bids");
 
                                 if !asks.is_empty() || !bids.is_empty() {
-                                    let mut updated = false;
                                     let inst_id_owned = inst_id.to_string();
                                     {
                                         let mut section = cache.bitget_future.write().await;
-                                        if let Some(item) = section.items.get_mut(inst_id) {
-                                            item.asks = asks;
-                                            item.bids = bids;
-                                            item.depth_ts = now_ms();
-                                            section.dirty = true;
-                                            updated = true;
-                                        }
+                                        let item = section
+                                            .items
+                                            .entry(inst_id_owned.clone())
+                                            .or_insert_with(|| {
+                                                let mut ei = ExchangeItem {
+                                                    name: inst_id_owned.clone(),
+                                                    ..Default::default()
+                                                };
+                                                if let Some((interval, max_rate)) = funding_info.get(inst_id) {
+                                                    ei.rate_interval = Some(*interval);
+                                                    ei.rate_max = Some(max_rate.clone());
+                                                }
+                                                ei
+                                            });
+                                        item.asks = asks;
+                                        item.bids = bids;
+                                        item.depth_ts = now_ms();
+                                        // Derive BBO from depth best levels
+                                        if let Some(best) = item.asks.first() { item.a = best.price; }
+                                        if let Some(best) = item.bids.first() { item.b = best.price; }
+                                        item.ts = item.depth_ts;
+                                        section.dirty = true;
                                     }
-                                    if updated {
+                                    {
                                         let now_inst = tokio::time::Instant::now();
                                         let should_fire = depth_throttle.get(&inst_id_owned)
                                             .map_or(true, |&last| now_inst.duration_since(last) >= std::time::Duration::from_millis(500));
@@ -510,8 +524,7 @@ async fn run_chunk(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(&arg.inst_id);
 
-                            let ask_pr = data.get("askPr").map(json_f64).unwrap_or(0.0);
-                            let bid_pr = data.get("bidPr").map(json_f64).unwrap_or(0.0);
+                            // bid/ask now driven by depth (books15) stream
                             let quote_volume = data.get("quoteVolume").map(json_f64).unwrap_or(0.0);
                             let rate_dec = data.get("fundingRate").map(json_f64).unwrap_or(0.0);
                             let mark_price = data.get("markPrice").map(json_f64).unwrap_or(0.0);
@@ -519,9 +532,7 @@ async fn run_chunk(
 
                             let rate_str = format!("{:.3}", rate_dec * 100.0);
 
-                            let ts = now_ms();
                             let mut section = cache.bitget_future.write().await;
-                            section.ts = ts;
 
                             let item = section
                                 .items
@@ -538,9 +549,6 @@ async fn run_chunk(
                                     ei
                                 });
 
-                            item.a = ask_pr;
-                            item.b = bid_pr;
-                            item.ts = ts;
                             item.trade24_count = quote_volume;
                             item.rate = Some(rate_str);
                             item.mark_price = Some(format!("{}", mark_price));
@@ -554,10 +562,7 @@ async fn run_chunk(
                                 }
                             }
                             section.dirty = true;
-                            drop(section);
-                            let _ = cache.ticker_tx.send(crate::spread::TickerChanged {
-                                symbol: inst_id.to_string(),
-                            });
+                            // No TickerChanged here -- depth updates drive spread recalc
                         }
                         _ = tokio::time::sleep_until(read_deadline) => {
                             tracing::warn!("bitget futures chunk-{}: no message for 30s, reconnecting", chunk_id);

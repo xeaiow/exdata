@@ -1,0 +1,4 @@
+clickhouse-connect>=0.7
+pandas>=2.0
+scipy>=1.11
+tabulate>=0.9
